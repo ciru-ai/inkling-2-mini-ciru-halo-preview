@@ -59,10 +59,10 @@ index 0000000..208f01a
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 diff --git a/vllm/models/inkling2/amd/attention.py b/vllm/models/inkling2/amd/attention.py
 new file mode 100644
-index 0000000..9352dd5
+index 0000000..14a3b89
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/attention.py
-@@ -0,0 +1,814 @@
+@@ -0,0 +1,817 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 attention: relative-bias GQA with short-conv K/V, L2-clipped
@@ -130,10 +130,10 @@ index 0000000..9352dd5
 +    )
 +
 +
-+def _can_project_w6_batch(x: torch.Tensor) -> bool:
++def _can_project_w6_batch(x: torch.Tensor, max_m: int = 8) -> bool:
 +    return (
 +        x.ndim == 2
-+        and 2 <= x.shape[0] <= 8
++        and 2 <= x.shape[0] <= max_m
 +        and x.shape[1] in (2304, 3072)
 +        and x.is_cuda
 +        and x.dtype == torch.bfloat16
@@ -342,7 +342,10 @@ index 0000000..9352dd5
 +        )
 +        self._qkv_cta_aligned = q_side % 4 == 0 and kv_size % 4 == 0
 +        self._fused_w8_qkv = os.getenv("INKLING_AMD_W8_FUSED_QKV") == "1"
-+        self._w6_verify_batch = os.getenv("INKLING_AMD_W6_VERIFY_ATTN") == "1"
++        self._w6_verify_batch = (
++            os.getenv("INKLING_AMD_W6_VERIFY_ATTN") == "1"
++            or os.getenv("INKLING_AMD_TURBO_W6_WMMA") == "1"
++        )
 +        self._w6_waves = int(os.getenv("INKLING_AMD_W6_ATTN_WAVES", "4"))
 +        pad_size = -sum(self.split_sizes) % 8
 +        if pad_size:
@@ -545,7 +548,7 @@ index 0000000..9352dd5
 +                self._w6_verify_batch
 +                and self._w6_wmma_qkvr is not None
 +                and self._w6_wmma_qkv_meta is not None
-+                and _can_project_w6_batch(x_q)
++                and _can_project_w6_batch(x_q, 64)
 +            ):
 +                from .ops.turbo_kernels import w6_wmma_qkv_linear
 +
@@ -574,9 +577,9 @@ index 0000000..9352dd5
 +            self._w6_verify_batch
 +            and self._w6_wmma_qkvr is not None
 +            and self._w6_wmma_qkv_meta is not None
-+            and _can_project_w6_batch(x_q)
-+            and _can_project_w6_batch(x_k)
-+            and _can_project_w6_batch(x_v)
++            and _can_project_w6_batch(x_q, 64)
++            and _can_project_w6_batch(x_k, 64)
++            and _can_project_w6_batch(x_v, 64)
 +        ):
 +            from .ops.turbo_kernels import w6_wmma_qkv_linear
 +
@@ -676,7 +679,7 @@ index 0000000..9352dd5
 +        if (
 +            self._w6_verify_batch
 +            and self._w6_wmma_wo is not None
-+            and _can_project_w6_batch(output)
++            and _can_project_w6_batch(output, 16)
 +        ):
 +            from .ops.turbo_kernels import w6_wmma_linear
 +
@@ -792,8 +795,8 @@ index 0000000..9352dd5
 +        if num_splits:
 +            if (
 +                self._turbo_prefill_attn
-+                and md.seq_lens.shape[0] == 1
-+                and 2 <= md.max_query_len <= 8
++                and (md.seq_lens.shape[0] > 1 or md.max_query_len >= 2)
++                and 1 <= md.max_query_len <= 8
 +                and key_cache.shape[1] in (16, 64)
 +            ):
 +                from .ops.turbo_kernels import turbo_rel_decode_m8_attention
@@ -1226,10 +1229,10 @@ index 0000000..b70dcd5
 +    )
 diff --git a/vllm/models/inkling2/amd/dspark.py b/vllm/models/inkling2/amd/dspark.py
 new file mode 100644
-index 0000000..53f2b0d
+index 0000000..35c912b
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/dspark.py
-@@ -0,0 +1,771 @@
+@@ -0,0 +1,793 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 DSpark draft (`mtp.safetensors`): an anchor plus mask block run
@@ -1551,11 +1554,13 @@ index 0000000..53f2b0d
 +        self.w4_down = None
 +
 +    def forward(self, x: torch.Tensor) -> torch.Tensor:
-+        if self.w4_gate_up is not None and 1 <= x.shape[0] <= 8 and x.shape[1] == self.w4_gate_up.in_features and x.dtype == torch.bfloat16:
++        if self.w4_gate_up is not None and 1 <= x.shape[0] <= 64 and x.shape[1] == self.w4_gate_up.in_features and x.dtype == torch.bfloat16:
 +            from .ops.turbo_kernels import w4_wmma_linear
 +
 +            x = silu_and_mul(w4_wmma_linear(x, self.w4_gate_up, splits=1))
-+            return w4_wmma_linear(x, self.w4_down, splits=4)
++            if x.shape[0] <= 16:
++                return w4_wmma_linear(x, self.w4_down, splits=4)
++            return _draft_linear(x, self.down_proj, self.w8_down)
 +        x = silu_and_mul(_draft_linear(x, self.gate_up_proj, self.w8_gate_up))
 +        return _draft_linear(x, self.down_proj, self.w8_down)
 +
@@ -1619,6 +1624,8 @@ index 0000000..53f2b0d
 +        self.w8_fold_weight: tuple[torch.Tensor, torch.Tensor] | None = None
 +        self.w6_fold_weight: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 +        self.w4_fold_weight: tuple[torch.Tensor, torch.Tensor] | None = None
++        self.w4_fold_wmma = None
++        self.fold_bias_pad: torch.Tensor | None = None
 +        self.rnn_bias: torch.Tensor | None = None
 +
 +    @torch.no_grad()
@@ -1666,6 +1673,16 @@ index 0000000..53f2b0d
 +        """One recurrence step; returns the new state and the TP-local bias."""
 +        assert self.fold_weight is not None and self.fold_bias is not None
 +        state, latent = self.step_latent(state, prev_tokens, context)
++        if (
++            self.w4_fold_wmma is not None
++            and 1 <= latent.shape[0] <= 16
++            and latent.dtype == torch.bfloat16
++        ):
++            from .ops.turbo_kernels import w4_wmma_linear
++
++            return state, w4_wmma_linear(
++                latent, self.w4_fold_wmma, bias=self.fold_bias_pad
++            )
 +        if self.w8_fold_weight is not None and latent.shape[0] == 1:
 +            from .ops.groupwise_w8_head import groupwise_w8_markov_addmm
 +
@@ -1823,7 +1840,6 @@ index 0000000..53f2b0d
 +        self._prepare_w8_backbone()
 +        if (
 +            os.getenv("INKLING_AMD_TURBO_DRAFT_W4") == "1"
-+            and self.max_num_reqs == 1
 +            and get_tensor_model_parallel_world_size() == 1
 +        ):
 +            from .ops.turbo_kernels import pack_w4_markov, pack_w4_wmma
@@ -1833,7 +1849,16 @@ index 0000000..53f2b0d
 +                layer.mlp.w4_gate_up = pack_w4_wmma(layer.mlp.gate_up_proj.weight)
 +                layer.mlp.w4_down = pack_w4_wmma(layer.mlp.down_proj.weight)
 +            if head.fold_weight is not None:
-+                head.w4_fold_weight = pack_w4_markov(head.fold_weight)
++                if self.max_num_reqs == 1:
++                    head.w4_fold_weight = pack_w4_markov(head.fold_weight)
++                head.w4_fold_wmma = pack_w4_wmma(head.fold_weight)
++                bias_pad = torch.zeros(
++                    head.w4_fold_wmma.padded_out,
++                    dtype=head.fold_bias.dtype,
++                    device=head.fold_bias.device,
++                )
++                bias_pad[: head.fold_bias.shape[0]].copy_(head.fold_bias)
++                head.fold_bias_pad = bias_pad
 +
 +    def _prepare_w8_backbone(self) -> None:
 +        assert self.lm_head is not None
@@ -1903,7 +1928,7 @@ index 0000000..53f2b0d
 +        if (
 +            self.w4_base_head is not None
 +            and hidden_states.ndim == 2
-+            and 1 <= hidden_states.shape[0] <= 8
++            and 1 <= hidden_states.shape[0] <= 64
 +            and hidden_states.dtype == torch.bfloat16
 +        ):
 +            from .ops.turbo_kernels import w4_wmma_linear
@@ -2003,10 +2028,10 @@ index 0000000..53f2b0d
 +        return loaded
 diff --git a/vllm/models/inkling2/amd/model.py b/vllm/models/inkling2/amd/model.py
 new file mode 100644
-index 0000000..3caef50
+index 0000000..e10d1f0
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/model.py
-@@ -0,0 +1,906 @@
+@@ -0,0 +1,907 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Eager TP1 text backend for Inkling 2 Mini on ROCm."""
@@ -2779,12 +2804,13 @@ index 0000000..3caef50
 +        return self.model(positions, inputs_embeds)
 +
 +    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
++        has_w6_wmma = getattr(self, "w6_wmma_head", None) is not None
 +        batched_w6 = (
-+            self.w6_head_batch_tile > 0
++            (self.w6_head_batch_tile > 0 or has_w6_wmma)
 +            and self.packed_head_format == "w6"
 +            and hidden_states.ndim == 2
 +            and hidden_states.shape[1] == self.text_config.hidden_size
-+            and 2 <= hidden_states.shape[0] <= 8
++            and 2 <= hidden_states.shape[0] <= (64 if has_w6_wmma else 8)
 +        )
 +        if (
 +            self.packed_head is not None
@@ -9755,10 +9781,10 @@ index 0000000..4ebf20e
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/turbo_kernels.py b/vllm/models/inkling2/amd/ops/turbo_kernels.py
 new file mode 100644
-index 0000000..ab5de88
+index 0000000..75c3a52
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/turbo_kernels.py
-@@ -0,0 +1,1627 @@
+@@ -0,0 +1,1830 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Ciru gfx1151 turbo kernels for Inkling 2 Mini PP & TG on vLLM."""
 +
@@ -10504,6 +10530,113 @@ index 0000000..ab5de88
 +    tl.store(Y + col, tl.sum(part, axis=0).to(tl.bfloat16), col < SIZE)
 +
 +
++@gluon.jit
++def _w6_wmma_batched_f16_kernel(
++    X, P4, P2, Scales, Y, M,
++    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr,
++    OUT_FP32: gl.constexpr, SOFT_CAP: gl.constexpr,
++):
++    tile_n = gl.program_id(0)
++    tile_m = gl.program_id(1)
++    k_tiles: gl.constexpr = K // 64
++    if M_TILE == 16:
++        mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
++        a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
++        out_layout: gl.constexpr = gl.DistributedLinearLayout(
++            [[0, 1], [0, 4], [0, 8], [0, 64]],
++            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
++            [[0, 16], [0, 32]], [], [16, 128],
++        )
++    else:
++        mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
++        a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
++        out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
++    b_byte: gl.constexpr = gl.DistributedLinearLayout(
++        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
++        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
++        [[16, 0], [32, 0]], [], [128, 32],
++    )
++    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
++    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
++    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
++    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
++    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
++    for kt in range(k_tiles):
++        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
++        tidx = (tile_n * k_tiles + kt) * 128 + b_row
++        p4 = gl.load(P4 + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
++        p2_word = gl.load(P2 + tidx[:, None] * 4 + (b_col[None, :] // 8))
++        shift = (b_col[None, :] & 7) * 4
++        h2_pair = (p2_word >> shift) & 15
++        sc = gl.load(Scales + tidx)
++        lo_q = (((p4 & 15) | ((h2_pair & 3) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
++        hi_q = (((p4 >> 4) | ((h2_pair >> 2) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
++        w = gl.reshape(gl.join(lo_q, hi_q), (128, 64))
++        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
++        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
++        acc = wmma(a, b, acc)
++    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
++    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
++    val = gl.convert_layout(acc, out_layout)
++    if SOFT_CAP > 0.0:
++        val = libdevice.tanh(val * (1.0 / SOFT_CAP)) * SOFT_CAP
++    if not OUT_FP32:
++        val = val.to(gl.bfloat16, fp_downcast_rounding="rtne")
++    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
++
++
++@gluon.jit
++def _w6_wmma_qkv_batched_f16_kernel(
++    XQ, XK, XV, P4, P2, Scales, Y, M,
++    Q_TILES: gl.constexpr, K_TILES_END: gl.constexpr,
++    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr,
++):
++    tile_n = gl.program_id(0)
++    tile_m = gl.program_id(1)
++    X = gl.where(tile_n < Q_TILES, XQ, gl.where(tile_n < K_TILES_END, XK, XV))
++    k_tiles: gl.constexpr = K // 64
++    if M_TILE == 16:
++        mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
++        a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
++        out_layout: gl.constexpr = gl.DistributedLinearLayout(
++            [[0, 1], [0, 4], [0, 8], [0, 64]],
++            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
++            [[0, 16], [0, 32]], [], [16, 128],
++        )
++    else:
++        mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
++        a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
++        out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
++    b_byte: gl.constexpr = gl.DistributedLinearLayout(
++        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
++        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
++        [[16, 0], [32, 0]], [], [128, 32],
++    )
++    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
++    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
++    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
++    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
++    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
++    for kt in range(k_tiles):
++        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
++        tidx = (tile_n * k_tiles + kt) * 128 + b_row
++        p4 = gl.load(P4 + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
++        p2_word = gl.load(P2 + tidx[:, None] * 4 + (b_col[None, :] // 8))
++        shift = (b_col[None, :] & 7) * 4
++        h2_pair = (p2_word >> shift) & 15
++        sc = gl.load(Scales + tidx)
++        lo_q = (((p4 & 15) | ((h2_pair & 3) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
++        hi_q = (((p4 >> 4) | ((h2_pair >> 2) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
++        w = gl.reshape(gl.join(lo_q, hi_q), (128, 64))
++        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
++        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
++        acc = wmma(a, b, acc)
++    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
++    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
++    val = gl.convert_layout(acc, out_layout).to(gl.bfloat16, fp_downcast_rounding="rtne")
++    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
++
++
 +def w6_wmma_linear(
 +    x: torch.Tensor, weight: W6WmmaWeight, *,
 +    out_dtype: torch.dtype = torch.bfloat16, soft_cap: float = 0.0, splits: int = 1,
@@ -10511,7 +10644,14 @@ index 0000000..ab5de88
 +    m, k = x.shape
 +    n_pad = weight.padded_out
 +    out = x.new_empty((m, n_pad), dtype=out_dtype)
-+    if splits == 1:
++    if m > 16:
++        bm = 32 if m <= 32 else 64
++        _w6_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
++            x.contiguous(), weight.p4, weight.p2, weight.scales, out, m,
++            N=n_pad, K=k, M_TILE=bm, OUT_FP32=out_dtype == torch.float32,
++            SOFT_CAP=soft_cap, num_warps=4, num_stages=1,
++        )
++    elif splits == 1:
 +        _w6_wmma_m8_kernel[(n_pad // 128, 1)](
 +            x.contiguous(), weight.p4, weight.p2, weight.scales, out, m,
 +            N=n_pad, K=k, SPLITS=1, OUT_FP32=out_dtype == torch.float32,
@@ -10537,12 +10677,21 @@ index 0000000..ab5de88
 +    m, k = x_q.shape
 +    n_pad = weight.padded_out
 +    out = x_q.new_empty((m, n_pad), dtype=torch.bfloat16)
-+    _w6_wmma_qkv_m8_kernel[(n_pad // 128,)](
-+        x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
-+        weight.p4, weight.p2, weight.scales, out, m,
-+        Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
-+        N=n_pad, K=k, num_warps=4, num_stages=1,
-+    )
++    if m > 16:
++        bm = 32 if m <= 32 else 64
++        _w6_wmma_qkv_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
++            x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
++            weight.p4, weight.p2, weight.scales, out, m,
++            Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
++            N=n_pad, K=k, M_TILE=bm, num_warps=4, num_stages=1,
++        )
++    else:
++        _w6_wmma_qkv_m8_kernel[(n_pad // 128,)](
++            x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
++            weight.p4, weight.p2, weight.scales, out, m,
++            Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
++            N=n_pad, K=k, num_warps=4, num_stages=1,
++        )
 +    return out
 +
 +
@@ -10636,11 +10785,72 @@ index 0000000..ab5de88
 +    )
 +
 +
-+def w4_wmma_linear(x: torch.Tensor, weight: W4WmmaWeight, *, splits: int = 1) -> torch.Tensor:
++@gluon.jit
++def _w4_wmma_batched_f16_kernel(
++    X, Packed, Scales, Bias, Y, M,
++    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr, HAS_BIAS: gl.constexpr,
++):
++    tile_n = gl.program_id(0)
++    tile_m = gl.program_id(1)
++    k_tiles: gl.constexpr = K // 64
++    if M_TILE == 16:
++        mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
++        a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
++        out_layout: gl.constexpr = gl.DistributedLinearLayout(
++            [[0, 1], [0, 4], [0, 8], [0, 64]],
++            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
++            [[0, 16], [0, 32]], [], [16, 128],
++        )
++    else:
++        mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
++        a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
++        out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
++    b_byte: gl.constexpr = gl.DistributedLinearLayout(
++        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
++        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
++        [[16, 0], [32, 0]], [], [128, 32],
++    )
++    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
++    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
++    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
++    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
++    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
++    for kt in range(k_tiles):
++        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
++        tidx = (tile_n * k_tiles + kt) * 128 + b_row
++        packed = gl.load(Packed + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
++        sc = gl.load(Scales + tidx)
++        lo = ((packed & 15).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
++        hi = ((packed >> 4).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
++        w = gl.reshape(gl.join(lo, hi), (128, 64))
++        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
++        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
++        acc = wmma(a, b, acc)
++    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
++    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
++    val = gl.convert_layout(acc, out_layout)
++    if HAS_BIAS:
++        bv = gl.load(Bias + tile_n * 128 + out_col, (tile_n * 128 + out_col) < N, 0).to(gl.float32)
++        val = val + bv[None, :]
++    val = val.to(gl.bfloat16, fp_downcast_rounding="rtne")
++    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
++
++
++def w4_wmma_linear(
++    x: torch.Tensor, weight: W4WmmaWeight, *, bias: torch.Tensor | None = None, splits: int = 1,
++) -> torch.Tensor:
 +    m, k = x.shape
 +    n_pad = weight.padded_out
 +    out = x.new_empty((m, n_pad), dtype=torch.bfloat16)
-+    if splits == 1:
++    if m > 16 or bias is not None:
++        bm = 16 if m <= 16 else (32 if m <= 32 else 64)
++        bias_arg = bias if bias is not None else out
++        _w4_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
++            x.contiguous(), weight.packed, weight.scales, bias_arg, out, m,
++            N=n_pad, K=k, M_TILE=bm, HAS_BIAS=bias is not None,
++            num_warps=4, num_stages=1,
++        )
++    elif splits == 1:
 +        _w4_wmma_m8_kernel[(n_pad // 128, 1)](
 +            x.contiguous(), weight.packed, weight.scales, out, m,
 +            N=n_pad, K=k, SPLITS=1, num_warps=4, num_stages=1,
@@ -10935,8 +11145,15 @@ index 0000000..ab5de88
 +    num_reqs = cache_seqlens.shape[0]
 +    extent = rel_logits.shape[2] - 256
 +    window = extent - 1 if is_local else -1
-+    # 10 splits for full (215 GB/s at 64K!), 8 splits for local
-+    num_splits = 8 if is_local else 10
++    # Adaptive split count by concurrent requests: preserves C1 64K peak & maximizes B=2..8 CU occupancy
++    if num_reqs == 1:
++        num_splits = 8 if is_local else 10
++    elif num_reqs == 2:
++        num_splits = 4 if is_local else 6
++    elif num_reqs <= 4:
++        num_splits = 2 if is_local else 4
++    else:
++        num_splits = 1 if is_local else 4
 +    block_n = 32 if page == 16 else 64
 +    o_part = q.new_empty((num_splits * num_tokens, num_heads, head_dim), dtype=torch.float32)
 +    lse_part = q.new_empty((num_heads, num_splits * num_tokens), dtype=torch.float32)
@@ -11307,20 +11524,23 @@ index 0000000..ab5de88
 +
 +@triton.jit
 +def _fused_loop_blend_p1_kernel(
-+    Hidden, Weight, Dest, Message, Blended, SumSq,
++    Hidden, Weight, Dest, Message, Blended, PartialSumSq,
 +    stride_dest_s, stride_dest_t, stride_message_s, stride_message_t,
 +    T, D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
++    D_PER_BLK: tl.constexpr, N_DBLK: tl.constexpr,
 +):
 +    t_blk = tl.program_id(0)
-+    s = tl.program_id(1).to(tl.int64)
++    d_grp = tl.program_id(1)
++    s = tl.program_id(2).to(tl.int64)
 +    t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
 +    k = tl.arange(0, 64)
 +    t_mask = t < T
 +    h = tl.load(Hidden + (s * T + t[:, None]) * 64 + k[None, :], t_mask[:, None], other=0.0)
 +    sum_sq = tl.zeros((BT,), tl.float32)
 +    d_offs = tl.arange(0, BD)
-+    for d0 in range(0, D, BD):
-+        d = d0 + d_offs
++    d_start = d_grp * D_PER_BLK
++    for off in range(0, D_PER_BLK, BD):
++        d = d_start + off + d_offs
 +        w_base = Weight + (s * (2 * D) + d[:, None]) * 64 + k[None, :]
 +        wg = tl.load(w_base)
 +        wf = tl.load(w_base + D * 64)
@@ -11331,13 +11551,13 @@ index 0000000..ab5de88
 +        b = (1.0 - forget) * dest + gain * msg
 +        sum_sq += tl.sum(b * b, axis=1)
 +        tl.store(Blended + (s * T + t[:, None]) * D + d[None, :], b.to(tl.bfloat16), t_mask[:, None])
-+    tl.store(SumSq + s * T + t, sum_sq, t_mask)
++    tl.store(PartialSumSq + (s * N_DBLK + d_grp) * T + t, sum_sq, t_mask)
 +
 +
 +@triton.jit
 +def _fused_loop_blend_p2_kernel(
-+    Blended, SumSq, NormWeight, Out, stride_w_s, T, norm_eps,
-+    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
++    Blended, PartialSumSq, NormWeight, Out, stride_w_s, T, norm_eps,
++    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, N_DBLK: tl.constexpr,
 +):
 +    t_blk = tl.program_id(0)
 +    d_blk = tl.program_id(1)
@@ -11345,7 +11565,15 @@ index 0000000..ab5de88
 +    t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
 +    d = d_blk * BD + tl.arange(0, BD)
 +    t_mask = t < T
-+    rstd = tl_hip_lib.rsqrt(tl.div_rn(tl.load(SumSq + s * T + t, t_mask, other=0.0), D) + norm_eps)
++    g = tl.arange(0, 16)
++    g_mask = g < N_DBLK
++    psq = tl.load(
++        PartialSumSq + (s * N_DBLK + g[:, None]) * T + t[None, :],
++        g_mask[:, None] & t_mask[None, :],
++        other=0.0,
++    )
++    sum_sq = tl.sum(psq, axis=0)
++    rstd = tl_hip_lib.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
 +    w = tl.load(NormWeight + s * stride_w_s + d).to(tl.float32)
 +    b = tl.load(Blended + (s * T + t[:, None]) * D + d[None, :], t_mask[:, None], other=0.0).to(tl.float32)
 +    tl.store(Out + (s * T + t[:, None]) * D + d[None, :], (b * rstd[:, None] * w[None, :]).to(tl.bfloat16), t_mask[:, None])
@@ -11361,7 +11589,7 @@ index 0000000..ab5de88
 +        return None
 +    streams, t_len, width = message.shape
 +    if (
-+        t_len < 64
++        t_len < 16
 +        or width != 2304
 +        or hidden.shape != (streams, t_len, 64)
 +        or weight.shape != (streams, 2 * width, 64)
@@ -11374,16 +11602,17 @@ index 0000000..ab5de88
 +    ):
 +        return None
 +    blended = message.new_empty(message.shape, dtype=torch.bfloat16)
-+    sum_sq = message.new_empty((streams, t_len), dtype=torch.float32)
++    partial_sum_sq = message.new_empty((streams, 9, t_len), dtype=torch.float32)
 +    out = message.new_empty(message.shape, dtype=torch.bfloat16)
-+    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, 32), streams)](
-+        hidden, weight, dest, message, blended, sum_sq,
++    bt = 16 if t_len <= 32 else 32
++    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, bt), 9, streams)](
++        hidden, weight, dest, message, blended, partial_sum_sq,
 +        *dest.stride()[:2], *message.stride()[:2], t_len,
-+        D=width, BT=32, BD=64, num_warps=4,
++        D=width, BT=bt, BD=64, D_PER_BLK=256, N_DBLK=9, num_warps=4,
 +    )
-+    _fused_loop_blend_p2_kernel[(triton.cdiv(t_len, 32), width // 128, streams)](
-+        blended, sum_sq, norm_weight, out, norm_weight.stride(0), t_len, norm_eps,
-+        D=width, BT=32, BD=128, num_warps=4,
++    _fused_loop_blend_p2_kernel[(triton.cdiv(t_len, bt), width // 128, streams)](
++        blended, partial_sum_sq, norm_weight, out, norm_weight.stride(0), t_len, norm_eps,
++        D=width, BT=bt, BD=128, N_DBLK=9, num_warps=4,
 +    )
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/vision.py b/vllm/models/inkling2/amd/ops/vision.py

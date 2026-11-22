@@ -46,7 +46,8 @@ Measured in Ciru's C1-fitted profile (`--batch-tokens 4096`, DSpark `K=7`):
 | 32K Context TG (DSpark `K=7`) | 49.41 tok/s | **63.69 tok/s** | **+28.9%** |
 | 64K Context TG (DSpark `K=7`) | 36.38 tok/s | **54.08 tok/s** | **+48.7%** |
 | Probabilistic DSpark (`prob`, eager, `K=7`) | ~20 tok/s | **36.51 tok/s** (`order` 55.52) | **~1.8×** |
-| C8 Eager Aggregate (8 concurrent, greedy `K=7`) | 88.58 tok/s | **88.92 tok/s** | +0.4% |
+| C8 Eager Aggregate (8 concurrent, greedy `K=7`) | 88.58 tok/s | **168.46 tok/s** *(Wave 6.0; Wave 5.2 was 88.92)* | **+90.2% (1.90×)** |
+| C8 Eager Aggregate (8 concurrent, `T=0.7`) | — | **173.83 tok/s** *(Wave 6.0)* | — |
 
 ### Unmodified Hugging Face checkpoint (`EXPERT_POLICY=source`, no fitted banks)
 
@@ -83,18 +84,19 @@ Functional verification checks (all passed on Wave 5.2):
 
 Tested end-to-end on the **8-agent AMD Logo 3D Studio** (`showcase` workflow, native ROCm vision enabled, native `inkling` reasoning & strict tool calling, probabilistic `T=0.7`, `prob --seqs 8 --context 32768 --batch-tokens 4096 --kv-mib 24576 --prefix-cache --tools --vision --turbo`):
 
-| Measurement | Result |
-|---|---:|
-| Workflow outcome | **Complete** (all 8 roles finished autonomously, revision 17) |
-| Total wall time (empty scene -> approved 3D scene) | **498.22 s** (8m 18s) |
-| First visible 3D contribution | 121.43 s |
-| Vision-bearing model requests | 37 (`0` server errors / aborts) |
-| Peak concurrent active agents | 8 |
-| Total prompt tokens (with prefix cache hits) | 261,409 (`40.9%` prefix-cache hit rate; up to 9,351 eff. PP tok/s) |
-| Total generated tokens (workflow / server) | 38,778 / 40,214 |
-| Whole-workflow output throughput | **77.83 tok/s** |
-| Aggregate active-decode TG | **77.37 tok/s** (17.38 tok/s pooled per-request; 40.8 tok/s solo at 11K ctx) |
-| DSpark `K=7` acceptance (`T=0.7`, 8-way concurrent) | **44.57%** (30,451 / 68,320 draft tokens; **4.12 tok/round**) |
+| Measurement | Wave 5.2 | Wave 6.0 | Delta |
+|---|---:|---:|---:|
+| Workflow outcome | **Complete** (rev 17) | **Complete** (rev 14) | All 8 roles autonomous |
+| Total wall time (empty scene -> approved 3D scene) | 498.22 s (8m 18s) | **404.72 s (6m 45s)** | **-93.5 s (-18.8%)** |
+| First visible 3D contribution | 121.43 s | **73.35 s** | **-48.1 s (1.66× faster)** |
+| Vision-bearing model requests | 37 (`0` errors) | 27 (`0` errors) | — |
+| Peak concurrent active agents | 8 | 8 | — |
+| Total generated tokens (workflow) | 38,778 | 34,898 | — |
+| Whole-workflow output throughput | 77.83 tok/s | **86.23 tok/s** | **+10.8%** |
+| Aggregate active-decode TG | 77.37 tok/s | **86.72 tok/s** | **+12.1%** |
+| Pooled per-request TG | 17.38 tok/s | **21.37 tok/s** | **+23.0%** |
+| Controlled C8 Greedy (`T=0`, 8 concurrent) | 88.92 tok/s | **168.46 tok/s** | **+89.5% (1.90×)** |
+| Controlled C8 Prob (`T=0.7`, 8 concurrent) | — | **173.83 tok/s** | — |
 
 ### Live 8-Agent ROCm GPU Profiler Breakdown (64 MB trace, `M=64` peak concurrency)
 

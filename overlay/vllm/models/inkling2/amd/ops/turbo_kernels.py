@@ -743,6 +743,113 @@ def _reduce_splits_bf16(Partial, Y, SIZE, SPLITS: tl.constexpr, BLOCK: tl.conste
     tl.store(Y + col, tl.sum(part, axis=0).to(tl.bfloat16), col < SIZE)
 
 
+@gluon.jit
+def _w6_wmma_batched_f16_kernel(
+    X, P4, P2, Scales, Y, M,
+    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr,
+    OUT_FP32: gl.constexpr, SOFT_CAP: gl.constexpr,
+):
+    tile_n = gl.program_id(0)
+    tile_m = gl.program_id(1)
+    k_tiles: gl.constexpr = K // 64
+    if M_TILE == 16:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
+        out_layout: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 1], [0, 4], [0, 8], [0, 64]],
+            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
+            [[0, 16], [0, 32]], [], [16, 128],
+        )
+    else:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
+        out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
+        [[16, 0], [32, 0]], [], [128, 32],
+    )
+    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
+    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
+    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
+    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
+    for kt in range(k_tiles):
+        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
+        tidx = (tile_n * k_tiles + kt) * 128 + b_row
+        p4 = gl.load(P4 + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
+        p2_word = gl.load(P2 + tidx[:, None] * 4 + (b_col[None, :] // 8))
+        shift = (b_col[None, :] & 7) * 4
+        h2_pair = (p2_word >> shift) & 15
+        sc = gl.load(Scales + tidx)
+        lo_q = (((p4 & 15) | ((h2_pair & 3) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        hi_q = (((p4 >> 4) | ((h2_pair >> 2) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        w = gl.reshape(gl.join(lo_q, hi_q), (128, 64))
+        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
+        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
+        acc = wmma(a, b, acc)
+    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
+    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    val = gl.convert_layout(acc, out_layout)
+    if SOFT_CAP > 0.0:
+        val = libdevice.tanh(val * (1.0 / SOFT_CAP)) * SOFT_CAP
+    if not OUT_FP32:
+        val = val.to(gl.bfloat16, fp_downcast_rounding="rtne")
+    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
+
+
+@gluon.jit
+def _w6_wmma_qkv_batched_f16_kernel(
+    XQ, XK, XV, P4, P2, Scales, Y, M,
+    Q_TILES: gl.constexpr, K_TILES_END: gl.constexpr,
+    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr,
+):
+    tile_n = gl.program_id(0)
+    tile_m = gl.program_id(1)
+    X = gl.where(tile_n < Q_TILES, XQ, gl.where(tile_n < K_TILES_END, XK, XV))
+    k_tiles: gl.constexpr = K // 64
+    if M_TILE == 16:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
+        out_layout: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 1], [0, 4], [0, 8], [0, 64]],
+            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
+            [[0, 16], [0, 32]], [], [16, 128],
+        )
+    else:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
+        out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
+        [[16, 0], [32, 0]], [], [128, 32],
+    )
+    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
+    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
+    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
+    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
+    for kt in range(k_tiles):
+        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
+        tidx = (tile_n * k_tiles + kt) * 128 + b_row
+        p4 = gl.load(P4 + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
+        p2_word = gl.load(P2 + tidx[:, None] * 4 + (b_col[None, :] // 8))
+        shift = (b_col[None, :] & 7) * 4
+        h2_pair = (p2_word >> shift) & 15
+        sc = gl.load(Scales + tidx)
+        lo_q = (((p4 & 15) | ((h2_pair & 3) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        hi_q = (((p4 >> 4) | ((h2_pair >> 2) << 4)).to(gl.int32) - 32).to(gl.float16) * sc[:, None]
+        w = gl.reshape(gl.join(lo_q, hi_q), (128, 64))
+        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
+        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
+        acc = wmma(a, b, acc)
+    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
+    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    val = gl.convert_layout(acc, out_layout).to(gl.bfloat16, fp_downcast_rounding="rtne")
+    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
+
+
 def w6_wmma_linear(
     x: torch.Tensor, weight: W6WmmaWeight, *,
     out_dtype: torch.dtype = torch.bfloat16, soft_cap: float = 0.0, splits: int = 1,
@@ -750,7 +857,14 @@ def w6_wmma_linear(
     m, k = x.shape
     n_pad = weight.padded_out
     out = x.new_empty((m, n_pad), dtype=out_dtype)
-    if splits == 1:
+    if m > 16:
+        bm = 32 if m <= 32 else 64
+        _w6_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
+            x.contiguous(), weight.p4, weight.p2, weight.scales, out, m,
+            N=n_pad, K=k, M_TILE=bm, OUT_FP32=out_dtype == torch.float32,
+            SOFT_CAP=soft_cap, num_warps=4, num_stages=1,
+        )
+    elif splits == 1:
         _w6_wmma_m8_kernel[(n_pad // 128, 1)](
             x.contiguous(), weight.p4, weight.p2, weight.scales, out, m,
             N=n_pad, K=k, SPLITS=1, OUT_FP32=out_dtype == torch.float32,
@@ -776,12 +890,21 @@ def w6_wmma_qkv_linear(
     m, k = x_q.shape
     n_pad = weight.padded_out
     out = x_q.new_empty((m, n_pad), dtype=torch.bfloat16)
-    _w6_wmma_qkv_m8_kernel[(n_pad // 128,)](
-        x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
-        weight.p4, weight.p2, weight.scales, out, m,
-        Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
-        N=n_pad, K=k, num_warps=4, num_stages=1,
-    )
+    if m > 16:
+        bm = 32 if m <= 32 else 64
+        _w6_wmma_qkv_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
+            x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
+            weight.p4, weight.p2, weight.scales, out, m,
+            Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
+            N=n_pad, K=k, M_TILE=bm, num_warps=4, num_stages=1,
+        )
+    else:
+        _w6_wmma_qkv_m8_kernel[(n_pad // 128,)](
+            x_q.contiguous(), x_k.contiguous(), x_v.contiguous(),
+            weight.p4, weight.p2, weight.scales, out, m,
+            Q_TILES=q_pad // 128, K_TILES_END=k_end // 128,
+            N=n_pad, K=k, num_warps=4, num_stages=1,
+        )
     return out
 
 
@@ -875,11 +998,72 @@ def _w4_wmma_m8_kernel(
     )
 
 
-def w4_wmma_linear(x: torch.Tensor, weight: W4WmmaWeight, *, splits: int = 1) -> torch.Tensor:
+@gluon.jit
+def _w4_wmma_batched_f16_kernel(
+    X, Packed, Scales, Bias, Y, M,
+    N: gl.constexpr, K: gl.constexpr, M_TILE: gl.constexpr, HAS_BIAS: gl.constexpr,
+):
+    tile_n = gl.program_id(0)
+    tile_m = gl.program_id(1)
+    k_tiles: gl.constexpr = K // 64
+    if M_TILE == 16:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[0, 1], [0, 2]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 64], [16, 2], [1, 4], [0, 1])
+        out_layout: gl.constexpr = gl.DistributedLinearLayout(
+            [[0, 1], [0, 4], [0, 8], [0, 64]],
+            [[1, 0], [2, 0], [4, 0], [8, 0], [0, 2]],
+            [[0, 16], [0, 32]], [], [16, 128],
+        )
+    else:
+        mma: gl.constexpr = AMDWMMALayout(1, True, [[1, 0], [0, 1]])
+        a_load: gl.constexpr = gl.BlockedLayout([1, 8], [8, 4], [2, 2], [0, 1])
+        out_layout: gl.constexpr = gl.BlockedLayout([1, 2], [2, 16], [2, 2], [1, 0])
+    b_byte: gl.constexpr = gl.DistributedLinearLayout(
+        [[0, 1], [0, 2], [0, 4], [0, 8], [0, 16]],
+        [[1, 0], [2, 0], [4, 0], [8, 0], [64, 0]],
+        [[16, 0], [32, 0]], [], [128, 32],
+    )
+    a_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, a_load))
+    a_col = gl.arange(0, 64, gl.SliceLayout(0, a_load))
+    b_row = gl.arange(0, 128, gl.SliceLayout(1, b_byte))
+    b_col = gl.arange(0, 32, gl.SliceLayout(0, b_byte))
+    acc = gl.zeros((M_TILE, 128), gl.float32, mma)
+    for kt in range(k_tiles):
+        x = gl.load(X + a_row[:, None] * K + (kt * 64 + a_col[None, :]), a_row[:, None] < M, 0).to(gl.float16)
+        tidx = (tile_n * k_tiles + kt) * 128 + b_row
+        packed = gl.load(Packed + tidx[:, None] * 32 + b_col[None, :]).to(gl.uint32)
+        sc = gl.load(Scales + tidx)
+        lo = ((packed & 15).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
+        hi = ((packed >> 4).to(gl.int32) - 8).to(gl.float16) * sc[:, None]
+        w = gl.reshape(gl.join(lo, hi), (128, 64))
+        a = gl.convert_layout(x, gl.DotOperandLayout(0, mma, 16))
+        b = gl.convert_layout(gl.permute(w, (1, 0)), gl.DotOperandLayout(1, mma, 16))
+        acc = wmma(a, b, acc)
+    out_row = tile_m * M_TILE + gl.arange(0, M_TILE, gl.SliceLayout(1, out_layout))
+    out_col = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    val = gl.convert_layout(acc, out_layout)
+    if HAS_BIAS:
+        bv = gl.load(Bias + tile_n * 128 + out_col, (tile_n * 128 + out_col) < N, 0).to(gl.float32)
+        val = val + bv[None, :]
+    val = val.to(gl.bfloat16, fp_downcast_rounding="rtne")
+    gl.store(Y + out_row[:, None] * N + tile_n * 128 + out_col[None, :], val, out_row[:, None] < M)
+
+
+def w4_wmma_linear(
+    x: torch.Tensor, weight: W4WmmaWeight, *, bias: torch.Tensor | None = None, splits: int = 1,
+) -> torch.Tensor:
     m, k = x.shape
     n_pad = weight.padded_out
     out = x.new_empty((m, n_pad), dtype=torch.bfloat16)
-    if splits == 1:
+    if m > 16 or bias is not None:
+        bm = 16 if m <= 16 else (32 if m <= 32 else 64)
+        bias_arg = bias if bias is not None else out
+        _w4_wmma_batched_f16_kernel[(n_pad // 128, triton.cdiv(m, bm))](
+            x.contiguous(), weight.packed, weight.scales, bias_arg, out, m,
+            N=n_pad, K=k, M_TILE=bm, HAS_BIAS=bias is not None,
+            num_warps=4, num_stages=1,
+        )
+    elif splits == 1:
         _w4_wmma_m8_kernel[(n_pad // 128, 1)](
             x.contiguous(), weight.packed, weight.scales, out, m,
             N=n_pad, K=k, SPLITS=1, num_warps=4, num_stages=1,
@@ -1174,8 +1358,15 @@ def turbo_rel_decode_m8_attention(
     num_reqs = cache_seqlens.shape[0]
     extent = rel_logits.shape[2] - 256
     window = extent - 1 if is_local else -1
-    # 10 splits for full (215 GB/s at 64K!), 8 splits for local
-    num_splits = 8 if is_local else 10
+    # Adaptive split count by concurrent requests: preserves C1 64K peak & maximizes B=2..8 CU occupancy
+    if num_reqs == 1:
+        num_splits = 8 if is_local else 10
+    elif num_reqs == 2:
+        num_splits = 4 if is_local else 6
+    elif num_reqs <= 4:
+        num_splits = 2 if is_local else 4
+    else:
+        num_splits = 1 if is_local else 4
     block_n = 32 if page == 16 else 64
     o_part = q.new_empty((num_splits * num_tokens, num_heads, head_dim), dtype=torch.float32)
     lse_part = q.new_empty((num_heads, num_splits * num_tokens), dtype=torch.float32)
@@ -1546,20 +1737,23 @@ def coda_wmma_turbo_projection(x, bank, plan, *, fused_activation=None):
 
 @triton.jit
 def _fused_loop_blend_p1_kernel(
-    Hidden, Weight, Dest, Message, Blended, SumSq,
+    Hidden, Weight, Dest, Message, Blended, PartialSumSq,
     stride_dest_s, stride_dest_t, stride_message_s, stride_message_t,
     T, D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
+    D_PER_BLK: tl.constexpr, N_DBLK: tl.constexpr,
 ):
     t_blk = tl.program_id(0)
-    s = tl.program_id(1).to(tl.int64)
+    d_grp = tl.program_id(1)
+    s = tl.program_id(2).to(tl.int64)
     t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
     k = tl.arange(0, 64)
     t_mask = t < T
     h = tl.load(Hidden + (s * T + t[:, None]) * 64 + k[None, :], t_mask[:, None], other=0.0)
     sum_sq = tl.zeros((BT,), tl.float32)
     d_offs = tl.arange(0, BD)
-    for d0 in range(0, D, BD):
-        d = d0 + d_offs
+    d_start = d_grp * D_PER_BLK
+    for off in range(0, D_PER_BLK, BD):
+        d = d_start + off + d_offs
         w_base = Weight + (s * (2 * D) + d[:, None]) * 64 + k[None, :]
         wg = tl.load(w_base)
         wf = tl.load(w_base + D * 64)
@@ -1570,13 +1764,13 @@ def _fused_loop_blend_p1_kernel(
         b = (1.0 - forget) * dest + gain * msg
         sum_sq += tl.sum(b * b, axis=1)
         tl.store(Blended + (s * T + t[:, None]) * D + d[None, :], b.to(tl.bfloat16), t_mask[:, None])
-    tl.store(SumSq + s * T + t, sum_sq, t_mask)
+    tl.store(PartialSumSq + (s * N_DBLK + d_grp) * T + t, sum_sq, t_mask)
 
 
 @triton.jit
 def _fused_loop_blend_p2_kernel(
-    Blended, SumSq, NormWeight, Out, stride_w_s, T, norm_eps,
-    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr,
+    Blended, PartialSumSq, NormWeight, Out, stride_w_s, T, norm_eps,
+    D: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr, N_DBLK: tl.constexpr,
 ):
     t_blk = tl.program_id(0)
     d_blk = tl.program_id(1)
@@ -1584,7 +1778,15 @@ def _fused_loop_blend_p2_kernel(
     t = (t_blk * BT + tl.arange(0, BT)).to(tl.int64)
     d = d_blk * BD + tl.arange(0, BD)
     t_mask = t < T
-    rstd = tl_hip_lib.rsqrt(tl.div_rn(tl.load(SumSq + s * T + t, t_mask, other=0.0), D) + norm_eps)
+    g = tl.arange(0, 16)
+    g_mask = g < N_DBLK
+    psq = tl.load(
+        PartialSumSq + (s * N_DBLK + g[:, None]) * T + t[None, :],
+        g_mask[:, None] & t_mask[None, :],
+        other=0.0,
+    )
+    sum_sq = tl.sum(psq, axis=0)
+    rstd = tl_hip_lib.rsqrt(tl.div_rn(sum_sq, D) + norm_eps)
     w = tl.load(NormWeight + s * stride_w_s + d).to(tl.float32)
     b = tl.load(Blended + (s * T + t[:, None]) * D + d[None, :], t_mask[:, None], other=0.0).to(tl.float32)
     tl.store(Out + (s * T + t[:, None]) * D + d[None, :], (b * rstd[:, None] * w[None, :]).to(tl.bfloat16), t_mask[:, None])
@@ -1600,7 +1802,7 @@ def fused_loop_prefill_blend(
         return None
     streams, t_len, width = message.shape
     if (
-        t_len < 64
+        t_len < 16
         or width != 2304
         or hidden.shape != (streams, t_len, 64)
         or weight.shape != (streams, 2 * width, 64)
@@ -1613,15 +1815,16 @@ def fused_loop_prefill_blend(
     ):
         return None
     blended = message.new_empty(message.shape, dtype=torch.bfloat16)
-    sum_sq = message.new_empty((streams, t_len), dtype=torch.float32)
+    partial_sum_sq = message.new_empty((streams, 9, t_len), dtype=torch.float32)
     out = message.new_empty(message.shape, dtype=torch.bfloat16)
-    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, 32), streams)](
-        hidden, weight, dest, message, blended, sum_sq,
+    bt = 16 if t_len <= 32 else 32
+    _fused_loop_blend_p1_kernel[(triton.cdiv(t_len, bt), 9, streams)](
+        hidden, weight, dest, message, blended, partial_sum_sq,
         *dest.stride()[:2], *message.stride()[:2], t_len,
-        D=width, BT=32, BD=64, num_warps=4,
+        D=width, BT=bt, BD=64, D_PER_BLK=256, N_DBLK=9, num_warps=4,
     )
-    _fused_loop_blend_p2_kernel[(triton.cdiv(t_len, 32), width // 128, streams)](
-        blended, sum_sq, norm_weight, out, norm_weight.stride(0), t_len, norm_eps,
-        D=width, BT=32, BD=128, num_warps=4,
+    _fused_loop_blend_p2_kernel[(triton.cdiv(t_len, bt), width // 128, streams)](
+        blended, partial_sum_sq, norm_weight, out, norm_weight.stride(0), t_len, norm_eps,
+        D=width, BT=bt, BD=128, N_DBLK=9, num_warps=4,
     )
     return out

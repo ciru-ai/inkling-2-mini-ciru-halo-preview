@@ -6,9 +6,9 @@ This GitHub preview packages Ciru's Wave 5.2 AMD ROCm backend, custom Triton FP1
 
 > **Preview status (GitHub only — not yet on Hugging Face):**
 > - **Native ROCm vision, reasoning, and tool calling:** Inkling 2 Mini's PE-Lang ViT vision encoder (`model.visual.*`), `inkling` reasoning parser, and native tool calling (`--enable-auto-tool-choice --tool-call-parser inkling`) all run natively on AMD ROCm `gfx1151`. Pass `--language-model-only` to `scripts/serve.sh` if you prefer text-only mode.
+> - **Wave 6.0 multi-agent concurrent kernels:** Unlocks pre-tiled Coda/Mixed FP16 WMMA in eager `c8`/`prob`, zero-spill batched `M<=64` FP16 W6/W4 WMMA (`QKVR`, `lm_head`, DSpark `base_head`/`MLP`/`Markov`), batched multi-request split-KV decode attention, and 9× D-split loop blend — lifting controlled 8-concurrent aggregate TG from **88.92 -> 168.46 tok/s (`1.90×`)** (`173.83 tok/s` at `T=0.7`) and cutting the full vision 8-agent AMD Logo 3D showcase from **498.2 s -> 404.7 s (`6m 45s`)**.
 > - **Known 64K prefill cliff**: Prompt processing reaches **1,691 tok/s at 4K**, **1,641 tok/s at 8K**, and **1,248 tok/s at 32K**, then drops to **789 tok/s at 64K** due to quadratic global-attention scaling across the 8 global visits and sustained thermal throttling.
-> - **Multi-agent concurrent kernels in progress**: Single-stream C1 decode is near the Strix Halo physical DRAM ceiling (**74.13 tok/s** with C1 coda banks, **69.8–84.1 tok/s** on stock HF weights). Eager multi-request (`c8` / staggered agent) workloads currently fall back to unbatched paths on several ops; profiling and dedicated concurrent kernels are next.
-> - **Custom runtime required**: Stock `pip install vllm` does not include the `gfx1151` Inkling 2 Mini AMD backend or Wave 5.2 kernels. Use the installer below with a ROCm 10 / vLLM 0.34 environment (or our full `ciru-ai/vllm` branch `inkling-2-mini-gfx1151-turbo-preview`).
+> - **Custom runtime required**: Stock `pip install vllm` does not include the `gfx1151` Inkling 2 Mini AMD backend or Wave 6.0 kernels. Use the installer below with a ROCm 10 / vLLM 0.34 environment (or our full `ciru-ai/vllm` branch `inkling-2-mini-gfx1151-turbo-preview`).
 
 [Installation Guide](INSTALL.md) · [Detailed Benchmarks & Quality Audit](BENCHMARKS.md) · [Full vLLM Branch](https://github.com/ciru-ai/vllm/tree/inkling-2-mini-gfx1151-turbo-preview)
 
@@ -53,7 +53,9 @@ Includes Ciru's optional C1-down bank (layers 6, 12, 17) and C1 coda layers (20�
 | TG — C1 Held Pooled (DSpark `K=7`) | 64.15 tok/s | **74.13 tok/s** | **+15.6%** |
 | TG — 32K Context (DSpark `K=7`) | 49.41 tok/s | **63.69 tok/s** | **+28.9%** |
 | TG — 64K Context (DSpark `K=7`) | 36.38 tok/s | **54.08 tok/s** | **+48.7%** |
-| TG — C8 Eager Aggregate (8 concurrent) | 88.58 tok/s | **88.92 tok/s** | +0.4% |
+| TG — C8 Eager Aggregate (8 concurrent, greedy `K=7`) | 88.58 tok/s | **168.46 tok/s** *(Wave 6.0)* | **+90.2% (1.90×)** |
+| TG — C8 Eager Aggregate (8 concurrent, `T=0.7`) | — | **173.83 tok/s** *(Wave 6.0)* | — |
+| Full Vision 8-Agent AMD Logo 3D Showcase | 498.2 s *(Wave 5.2)* | **404.7 s** *(Wave 6.0, 6m 45s)* | **-18.8% wall / 1.66× faster first publish** |
 
 See [BENCHMARKS.md](BENCHMARKS.md) for per-prompt breakdowns, 2,044-token KL/NLL audit numbers, GPU profiler roofline receipts, and multi-agent kernel roadmap.
 

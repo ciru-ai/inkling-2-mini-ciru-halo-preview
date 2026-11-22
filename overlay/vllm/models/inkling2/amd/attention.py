@@ -65,10 +65,10 @@ def _can_project_packed_m1(x: torch.Tensor) -> bool:
     )
 
 
-def _can_project_w6_batch(x: torch.Tensor) -> bool:
+def _can_project_w6_batch(x: torch.Tensor, max_m: int = 8) -> bool:
     return (
         x.ndim == 2
-        and 2 <= x.shape[0] <= 8
+        and 2 <= x.shape[0] <= max_m
         and x.shape[1] in (2304, 3072)
         and x.is_cuda
         and x.dtype == torch.bfloat16
@@ -277,7 +277,10 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         )
         self._qkv_cta_aligned = q_side % 4 == 0 and kv_size % 4 == 0
         self._fused_w8_qkv = os.getenv("INKLING_AMD_W8_FUSED_QKV") == "1"
-        self._w6_verify_batch = os.getenv("INKLING_AMD_W6_VERIFY_ATTN") == "1"
+        self._w6_verify_batch = (
+            os.getenv("INKLING_AMD_W6_VERIFY_ATTN") == "1"
+            or os.getenv("INKLING_AMD_TURBO_W6_WMMA") == "1"
+        )
         self._w6_waves = int(os.getenv("INKLING_AMD_W6_ATTN_WAVES", "4"))
         pad_size = -sum(self.split_sizes) % 8
         if pad_size:
@@ -480,7 +483,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 self._w6_verify_batch
                 and self._w6_wmma_qkvr is not None
                 and self._w6_wmma_qkv_meta is not None
-                and _can_project_w6_batch(x_q)
+                and _can_project_w6_batch(x_q, 64)
             ):
                 from .ops.turbo_kernels import w6_wmma_qkv_linear
 
@@ -509,9 +512,9 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             self._w6_verify_batch
             and self._w6_wmma_qkvr is not None
             and self._w6_wmma_qkv_meta is not None
-            and _can_project_w6_batch(x_q)
-            and _can_project_w6_batch(x_k)
-            and _can_project_w6_batch(x_v)
+            and _can_project_w6_batch(x_q, 64)
+            and _can_project_w6_batch(x_k, 64)
+            and _can_project_w6_batch(x_v, 64)
         ):
             from .ops.turbo_kernels import w6_wmma_qkv_linear
 
@@ -611,7 +614,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if (
             self._w6_verify_batch
             and self._w6_wmma_wo is not None
-            and _can_project_w6_batch(output)
+            and _can_project_w6_batch(output, 16)
         ):
             from .ops.turbo_kernels import w6_wmma_linear
 
@@ -727,8 +730,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if num_splits:
             if (
                 self._turbo_prefill_attn
-                and md.seq_lens.shape[0] == 1
-                and 2 <= md.max_query_len <= 8
+                and (md.seq_lens.shape[0] > 1 or md.max_query_len >= 2)
+                and 1 <= md.max_query_len <= 8
                 and key_cache.shape[1] in (16, 64)
             ):
                 from .ops.turbo_kernels import turbo_rel_decode_m8_attention

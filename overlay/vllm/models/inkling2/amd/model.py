@@ -770,12 +770,13 @@ class Inkling2LoopForConditionalGeneration(
         return self.model(positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        has_w6_wmma = getattr(self, "w6_wmma_head", None) is not None
         batched_w6 = (
-            self.w6_head_batch_tile > 0
+            (self.w6_head_batch_tile > 0 or has_w6_wmma)
             and self.packed_head_format == "w6"
             and hidden_states.ndim == 2
             and hidden_states.shape[1] == self.text_config.hidden_size
-            and 2 <= hidden_states.shape[0] <= 8
+            and 2 <= hidden_states.shape[0] <= (64 if has_w6_wmma else 8)
         )
         if (
             self.packed_head is not None

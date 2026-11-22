@@ -18,11 +18,24 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsEagle3
+from vllm.model_executor.models.interfaces import (
+    MultiModalEmbeddings,
+    SupportsEagle3,
+    SupportsMultiModal,
+)
+from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
 from ..configs import Inkling2MMConfig, Inkling2ModelConfig
+from ..processing import (
+    IMAGE_PLACEHOLDER,
+    Inkling2DummyInputsBuilder,
+    Inkling2MultiModalProcessor,
+    Inkling2ProcessingInfo,
+)
 from ..quant_config import Inkling2QuantConfig
+from .vision import Inkling2VisionEncoder
 from .attention import Inkling2Attention
 from .conv_state import InklingConvState
 from .moe import PROJECTIONS, Inkling2MoE, QuantFormat, coda_c1_paths
@@ -566,7 +579,16 @@ class Inkling2LoopModel(nn.Module):
         return out
 
 
-class Inkling2LoopForConditionalGeneration(nn.Module, SupportsEagle3):
+@MULTIMODAL_REGISTRY.register_processor(
+    Inkling2MultiModalProcessor,
+    info=Inkling2ProcessingInfo,
+    dummy_inputs=Inkling2DummyInputsBuilder,
+)
+class Inkling2LoopForConditionalGeneration(
+    nn.Module,
+    SupportsMultiModal,
+    SupportsEagle3,
+):
     """Load the released Mini checkpoint through the vLLM text registry."""
 
     # Weights mirror the checkpoint names after these substitutions, except for
@@ -632,6 +654,14 @@ class Inkling2LoopForConditionalGeneration(nn.Module, SupportsEagle3):
             raise ValueError("Expected a quantized Inkling 2 Mini loop checkpoint")
         self.config = config
         self.text_config = text_config = config.text_config
+        mm_cfg = model_config.multimodal_config
+        self.visual = (
+            Inkling2VisionEncoder(config.vision_config, text_config.hidden_size)
+            if config.vision_config is not None
+            and mm_cfg is not None
+            and mm_cfg.get_limit_per_prompt("image")
+            else None
+        )
         self.model = Inkling2LoopModel(text_config, quant_config, f"{prefix}model")
         self.lm_head = ParallelLMHead(text_config.padded_vocab_size, text_config.hidden_size)
         self.logits_processor = LogitsProcessor(
@@ -686,8 +716,39 @@ class Inkling2LoopForConditionalGeneration(nn.Module, SupportsEagle3):
             self.packed_head = pack_lossless_bf16(weight.detach().cpu()).to(weight.device)
             print(f"Inkling ROCm lossless BF16 LM head: {self.packed_head.storage_bytes} bytes", flush=True)
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return IMAGE_PLACEHOLDER
+        raise ValueError("Only image modality is supported")
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        patches = kwargs.get("vision_pixels")
+        grid_thw = kwargs.get("vision_grid_thw")
+        if patches is None or grid_thw is None:
+            return ()
+        assert isinstance(patches, torch.Tensor)
+        assert isinstance(grid_thw, torch.Tensor)
+        assert self.visual is not None
+        embeds = self.visual(patches, grid_thw)
+        return embeds.split(grid_thw.prod(-1).tolist())
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        inputs_embeds = self.model.embed_input_ids(input_ids)
+        if not multimodal_embeddings:
+            return inputs_embeds
+        assert is_multimodal is not None
+        return _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
 
     def get_language_model(self) -> nn.Module:
         return self
@@ -701,6 +762,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module, SupportsEagle3):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         if inputs_embeds is None:
             assert input_ids is not None
@@ -789,8 +851,11 @@ class Inkling2LoopForConditionalGeneration(nn.Module, SupportsEagle3):
         }
         loaded: set[str] = set()
         loaded_shards: set[tuple[str, int]] = set()
+        visual_weights: list[tuple[str, torch.Tensor]] = []
         for name, weight in weights:
             if name.startswith("model.visual."):
+                if self.visual is not None:
+                    visual_weights.append((name.removeprefix("model.visual."), weight))
                 continue
             for old, new in self._renames:
                 name = name.replace(old, new)
@@ -834,6 +899,8 @@ class Inkling2LoopForConditionalGeneration(nn.Module, SupportsEagle3):
             fused = next(f for f in num_shards if f in name)
             if count == num_shards[fused]:
                 loaded.add(name)
+        if self.visual is not None:
+            loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
         if missing := params.keys() - loaded:
             raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")
         return loaded

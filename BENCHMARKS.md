@@ -79,18 +79,49 @@ Functional verification checks (all passed on Wave 5.2):
 
 ---
 
-## 5. Single-stream GPU roofline & next kernel targets
+## 5. Realistic Multi-Agent Vision Workload (8-Agent AMD Logo 3D Studio) & GPU Trace
 
-Torch ROCm profiler traces captured on C1 DSpark `K=7` decode show **94.2% GPU utilization**:
-- **35.8 ms/round (71% of round time)** is spent inside MoE expert weight reads, sustaining **>90–95% of Strix Halo's ~240 GB/s physical DRAM read ceiling**.
-- **3.3 ms/round** is host scheduling/launch gap.
+Tested end-to-end on the **8-agent AMD Logo 3D Studio** (`showcase` workflow, native ROCm vision enabled, native `inkling` reasoning & strict tool calling, probabilistic `T=0.7`, `prob --seqs 8 --context 32768 --batch-tokens 4096 --kv-mib 24576 --prefix-cache --tools --vision --turbo`):
 
-### Where additional kernels will deliver the next major gains
+| Measurement | Result |
+|---|---:|
+| Workflow outcome | **Complete** (all 8 roles finished autonomously, revision 17) |
+| Total wall time (empty scene -> approved 3D scene) | **498.22 s** (8m 18s) |
+| First visible 3D contribution | 121.43 s |
+| Vision-bearing model requests | 37 (`0` server errors / aborts) |
+| Peak concurrent active agents | 8 |
+| Total prompt tokens (with prefix cache hits) | 261,409 (`40.9%` prefix-cache hit rate; up to 9,351 eff. PP tok/s) |
+| Total generated tokens (workflow / server) | 38,778 / 40,214 |
+| Whole-workflow output throughput | **77.83 tok/s** |
+| Aggregate active-decode TG | **77.37 tok/s** (17.38 tok/s pooled per-request; 40.8 tok/s solo at 11K ctx) |
+| DSpark `K=7` acceptance (`T=0.7`, 8-way concurrent) | **44.57%** (30,451 / 68,320 draft tokens; **4.12 tok/round**) |
 
-1. **64K Global Attention & Thermal/Bandwidth Efficiency:** Improve tiling/split-K and register occupancy in the 8 global attention visits for 32K–64K+ prefills to eliminate the 64K PP drop-off (`1,248 -> 789 tok/s`).
-2. **Multi-Agent / Concurrent (`seqs > 1`, `M > 8`) Kernels:**
-   - Extend W6 WMMA (`QKVR`, `WO`, `lm_head`) beyond `M <= 8` so concurrent eager batches (`M = 16..64`) stop falling back to BF16.
-   - Extend W4 DSpark `base_head` and `Markov` kernels to batched multi-request draft steps (`reqs > 1`).
-   - Generalize `turbo_rel_decode_m8_attention` beyond `seq_lens.shape[0] == 1` so concurrent decode batches get split-KV wave32 attention instead of the slower generic decode kernel.
-   - Add multi-request HIP graph capture buckets (`reqs = 1, 2, 4, 8`) for eager concurrent serving.
-3. **ROCm Vision Encoder (`model.visual.*`):** Wire Inkling 2 Mini's vision tower to ROCm so multimodal agent workflows run natively without `--language-model-only`.
+### Live 8-Agent ROCm GPU Profiler Breakdown (64 MB trace, `M=64` peak concurrency)
+
+Captured during peak 8-agent concurrency (`4.487 s` span, `3.646 s` GPU busy = **81.3% busy**, `30,346` GPU kernel launches across 18 rounds):
+
+| Kernel / Category | GPU Time | Share of Busy | Launches | Root Cause & Next Kernel Fix |
+|---|---:|---:|---:|---|
+| `_source_wmma_turbo_kernel` (NVFP4 MoE) | 1,145.2 ms | 31.4% | 1,260 | Already fast (`909 us/call`) |
+| `_packed_prefill_kernel` (Mixed/Coda MoE fallback) | **819.5 ms** | **22.5%** | 468 | **`CODA_WMMA_PRETILE` / `MIXED_WMMA_PRETILE` gated on `target_graph=1`** (`1,751 us/call`, ~2× slower than turbo!) |
+| `hipBLASLt/rocBLAS` BF16 GEMM (`QKVR`/`WO`/`LM_head`/`DSpark`) | **731.3 ms** | **20.1%** | 5,328 | **W6/W4 WMMA gated on `M <= 8`** (`0.22 ms` quant linear vs `731 ms` BF16 at `M=64`!) |
+| `_rel_attention_kernel` (unbatched decode fallback) | **636.8 ms** | **17.5%** | 918 | **`turbo_rel_decode_m8_attention` gated on `B == 1`** (`694 us/call`) |
+| Host launch gap (GPU idle) | **841.0 ms** | *(18.7% wall)* | — | Eager mode (`1,686` launches/round, no multi-req HIP graphs) |
+| `_fused_loop_blend_p1_kernel` + sampling (`topk_topp`/`tanh`) | 151.2 ms | 4.1% | 918 | Uncoalesced `M=64` loop blend + 4-pass 200K vocab sampling |
+
+---
+
+## 6. Single-stream GPU roofline & prioritized next kernel targets
+
+Single-stream C1 DSpark `K=7` traces show **94.2% GPU utilization** (`35.8 ms/round` = 71% MoE sustaining >90–95% of Strix Halo's ~240 GB/s physical DRAM read ceiling; `3.3 ms/round` host gap).
+
+### Highest-ROI next kernels (from live 64K + 8-agent AMD Logo 3D traces)
+
+1. **Enable Pre-Tiled Coda & Mixed FP16 WMMA in Eager `c8`/`prob` (`~400 ms / 11%` GPU saved immediately):** Remove the `target_graph` gate on `CODA_WMMA_PRETILE` and `MIXED_WMMA_PRETILE` so the 13 mixed/coda visits per round stop falling back to `_packed_prefill_kernel`.
+2. **Batched `M=9..64` W6 & W4 WMMA (`~450–500 ms / 13%` GPU saved):** Generalize `w6_wmma_linear` (`QKVR`, `WO`, `lm_head`) and W4 DSpark (`base_head`, `MLP`, `Markov`) beyond `M <= 8` so concurrent multi-agent batches read 4–6 bit weights instead of BF16.
+3. **Batched Multi-Request Split-KV Decode Attention (`~450 ms / 12%` GPU saved):** Extend `turbo_rel_decode_m8_attention` from `seq_lens.shape[0] == 1` to `grid = (B, H, splits)` to replace `_rel_attention_kernel` during concurrent decoding.
+4. **Multi-Request HIP Graph Capture Buckets (`reqs = 1, 2, 4, 8`) (`~650 ms` host gap saved):** Eliminates the 18.7% CPU launch idle time across 1,686 kernel dispatches/round in eager `c8`/`prob`.
+5. **64K Global Attention Tiling:** Improve tiling/split-K and register occupancy in the 8 global attention visits for 32K–64K+ prefills to close the 64K PP drop-off (`1,248 -> 789 tok/s`).
+6. **Fused Multi-Token Loop Blend & Logits+Softcap+Sampling:** Optimize `fused_loop_blend` for `M > 8` and fuse `tanh` softcap + temperature + top-k/top-p over the 200K vocabulary.
+
+**Combined projected multi-agent impact (items 1–4):** `4.49 s -> ~2.5 s` per 18 rounds (**~1.8× faster concurrent multi-agent throughput**, lifting 8-agent aggregate TG from ~77–89 tok/s to **~140–160+ tok/s**).

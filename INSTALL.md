@@ -2,7 +2,7 @@
 
 This preview packages the Ciru Wave 5.2 AMD ROCm (`gfx1151`) backend, Triton FP16 WMMA / W6 / W4 / attention kernels, portable installer, and serving launcher for [Thinking Machines Lab `Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini) (`6e7c8248f75265bdd4fbab5273304243b5d8c2cb`).
 
-> **Preview scope:** This repository is a GitHub code/overlay preview. It runs directly against the unmodified upstream Hugging Face checkpoint (`thinkingmachines/Inkling-2-Mini`, Apache-2.0) in **text-only mode** (`--language-model-only`). Optional C1-fitted expert banks are not hosted here yet; a full Hugging Face release bundle will follow after the 64K attention/thermal drop-off and multi-agent concurrent kernels are finalized.
+> **Preview scope:** This repository is a GitHub code/overlay preview. It runs directly against the unmodified upstream Hugging Face checkpoint (`thinkingmachines/Inkling-2-Mini`, Apache-2.0) with **native ROCm vision, reasoning, and tool calling** enabled by default (pass `--language-model-only` to disable vision). Optional C1-fitted expert banks are not hosted here yet; a full Hugging Face release bundle will follow after the 64K attention/thermal drop-off and multi-agent concurrent kernels are finalized.
 
 ---
 
@@ -166,4 +166,4 @@ bash "$HOME/.local/opt/inkling-2-mini-preview/serve.sh" \
 - **Permission denied on `/dev/kfd`**: Confirm `id` shows `render` and `video`, and `ls -la /dev/kfd` is writable.
 - **First launch takes 1–3 minutes**: Triton compiles and caches `gfx1151` kernels on first run into `${XDG_CACHE_HOME:-$HOME/.cache}/inkling-ciru-triton` (and HIP graph capture runs during startup). Subsequent launches reuse the cache.
 - **64K prompt processing drop-off**: Known preview issue — PP peaks at ~1,691 tok/s at 4K–8K and ~1,248 tok/s at 32K, dropping to ~789 tok/s at 64K due to quadratic global-attention scaling across the 8 global visits and sustained thermal/power throttling. Use `--context 32768` for best sustained throughput until the 64K FlashAttention tiling pass lands.
-- **Images / vision requests rejected**: The AMD ROCm backend currently runs with `--language-model-only` (`model.visual.*` is not yet wired to ROCm). Vision support is planned for a subsequent release.
+- **Vision / text-only mode**: Native ROCm vision (`model.visual.*`) is enabled by default in `scripts/serve.sh`. Pass `--language-model-only` to skip loading the vision tower if you only need text.

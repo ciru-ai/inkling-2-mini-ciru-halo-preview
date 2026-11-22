@@ -30,6 +30,8 @@ Modes & Serving Options:
   --no-spec               Disable DSpark speculative decoding
   --prefix-cache          Enable vLLM prefix caching
   --tools                 Enable Inkling native auto tool calling
+  --vision                Enable native ROCm vision encoder (default: on)
+  --language-model-only   Disable vision encoder to save ~0.6 GiB RAM
   --no-turbo              Disable Wave 5.2 FP16 WMMA / Turbo kernels (use baseline ROCm path)
   --draft-graph           Enable DSpark draft HIP graph (default: on in c1/long with --turbo)
   --no-draft-graph        Disable DSpark draft HIP graph
@@ -67,6 +69,7 @@ spec_tokens=7
 speculation=1
 prefix_cache=0
 tools=0
+vision=1
 turbo=1
 draft_graph=auto
 python_bin="${INKLING_PYTHON:-}"
@@ -96,6 +99,8 @@ while (( $# )); do
         --no-spec) speculation=0 ;;
         --prefix-cache) prefix_cache=1 ;;
         --tools) tools=1 ;;
+        --vision) vision=1 ;;
+        --language-model-only) vision=0 ;;
         --no-turbo) turbo=0 ;;
         --draft-graph) draft_graph=1 ;;
         --no-draft-graph) draft_graph=0 ;;
@@ -283,11 +288,14 @@ command=(
     "$python_bin" -m vllm.entrypoints.cli.main serve "$model"
     --served-model-name "$served_name"
     --host "$host" --port "$port"
-    --language-model-only --dtype bfloat16 --reasoning-parser inkling
+    --dtype bfloat16 --reasoning-parser inkling
     --max-model-len "$context" --max-num-seqs "$seqs"
     --max-num-batched-tokens "$batch_tokens"
     --kv-cache-memory-bytes "$((kv_mib * 1048576))"
 )
+if (( ! vision )); then
+    command+=(--language-model-only)
+fi
 if [[ -n "$prefill_chunk" ]]; then
     command+=(--long-prefill-token-threshold "$prefill_chunk")
 fi

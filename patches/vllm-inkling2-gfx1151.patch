@@ -2003,10 +2003,10 @@ index 0000000..53f2b0d
 +        return loaded
 diff --git a/vllm/models/inkling2/amd/model.py b/vllm/models/inkling2/amd/model.py
 new file mode 100644
-index 0000000..a0dfa6b
+index 0000000..3caef50
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/model.py
-@@ -0,0 +1,839 @@
+@@ -0,0 +1,906 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Eager TP1 text backend for Inkling 2 Mini on ROCm."""
@@ -2027,11 +2027,24 @@ index 0000000..a0dfa6b
 +    VocabParallelEmbedding,
 +)
 +from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-+from vllm.model_executor.models.interfaces import SupportsEagle3
++from vllm.model_executor.models.interfaces import (
++    MultiModalEmbeddings,
++    SupportsEagle3,
++    SupportsMultiModal,
++)
++from vllm.model_executor.models.utils import _merge_multimodal_embeddings
++from vllm.multimodal import MULTIMODAL_REGISTRY
 +from vllm.sequence import IntermediateTensors
 +
 +from ..configs import Inkling2MMConfig, Inkling2ModelConfig
++from ..processing import (
++    IMAGE_PLACEHOLDER,
++    Inkling2DummyInputsBuilder,
++    Inkling2MultiModalProcessor,
++    Inkling2ProcessingInfo,
++)
 +from ..quant_config import Inkling2QuantConfig
++from .vision import Inkling2VisionEncoder
 +from .attention import Inkling2Attention
 +from .conv_state import InklingConvState
 +from .moe import PROJECTIONS, Inkling2MoE, QuantFormat, coda_c1_paths
@@ -2575,7 +2588,16 @@ index 0000000..a0dfa6b
 +        return out
 +
 +
-+class Inkling2LoopForConditionalGeneration(nn.Module, SupportsEagle3):
++@MULTIMODAL_REGISTRY.register_processor(
++    Inkling2MultiModalProcessor,
++    info=Inkling2ProcessingInfo,
++    dummy_inputs=Inkling2DummyInputsBuilder,
++)
++class Inkling2LoopForConditionalGeneration(
++    nn.Module,
++    SupportsMultiModal,
++    SupportsEagle3,
++):
 +    """Load the released Mini checkpoint through the vLLM text registry."""
 +
 +    # Weights mirror the checkpoint names after these substitutions, except for
@@ -2641,6 +2663,14 @@ index 0000000..a0dfa6b
 +            raise ValueError("Expected a quantized Inkling 2 Mini loop checkpoint")
 +        self.config = config
 +        self.text_config = text_config = config.text_config
++        mm_cfg = model_config.multimodal_config
++        self.visual = (
++            Inkling2VisionEncoder(config.vision_config, text_config.hidden_size)
++            if config.vision_config is not None
++            and mm_cfg is not None
++            and mm_cfg.get_limit_per_prompt("image")
++            else None
++        )
 +        self.model = Inkling2LoopModel(text_config, quant_config, f"{prefix}model")
 +        self.lm_head = ParallelLMHead(text_config.padded_vocab_size, text_config.hidden_size)
 +        self.logits_processor = LogitsProcessor(
@@ -2695,8 +2725,39 @@ index 0000000..a0dfa6b
 +            self.packed_head = pack_lossless_bf16(weight.detach().cpu()).to(weight.device)
 +            print(f"Inkling ROCm lossless BF16 LM head: {self.packed_head.storage_bytes} bytes", flush=True)
 +
-+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-+        return self.model.embed_input_ids(input_ids)
++    @classmethod
++    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
++        if modality.startswith("image"):
++            return IMAGE_PLACEHOLDER
++        raise ValueError("Only image modality is supported")
++
++    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
++        patches = kwargs.get("vision_pixels")
++        grid_thw = kwargs.get("vision_grid_thw")
++        if patches is None or grid_thw is None:
++            return ()
++        assert isinstance(patches, torch.Tensor)
++        assert isinstance(grid_thw, torch.Tensor)
++        assert self.visual is not None
++        embeds = self.visual(patches, grid_thw)
++        return embeds.split(grid_thw.prod(-1).tolist())
++
++    def embed_input_ids(
++        self,
++        input_ids: torch.Tensor,
++        multimodal_embeddings: MultiModalEmbeddings | None = None,
++        *,
++        is_multimodal: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        inputs_embeds = self.model.embed_input_ids(input_ids)
++        if not multimodal_embeddings:
++            return inputs_embeds
++        assert is_multimodal is not None
++        return _merge_multimodal_embeddings(
++            inputs_embeds=inputs_embeds,
++            multimodal_embeddings=multimodal_embeddings,
++            is_multimodal=is_multimodal,
++        )
 +
 +    def get_language_model(self) -> nn.Module:
 +        return self
@@ -2710,6 +2771,7 @@ index 0000000..a0dfa6b
 +        positions: torch.Tensor,
 +        intermediate_tensors: IntermediateTensors | None = None,
 +        inputs_embeds: torch.Tensor | None = None,
++        **kwargs: object,
 +    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
 +        if inputs_embeds is None:
 +            assert input_ids is not None
@@ -2798,8 +2860,11 @@ index 0000000..a0dfa6b
 +        }
 +        loaded: set[str] = set()
 +        loaded_shards: set[tuple[str, int]] = set()
++        visual_weights: list[tuple[str, torch.Tensor]] = []
 +        for name, weight in weights:
 +            if name.startswith("model.visual."):
++                if self.visual is not None:
++                    visual_weights.append((name.removeprefix("model.visual."), weight))
 +                continue
 +            for old, new in self._renames:
 +                name = name.replace(old, new)
@@ -2843,6 +2908,8 @@ index 0000000..a0dfa6b
 +            fused = next(f for f in num_shards if f in name)
 +            if count == num_shards[fused]:
 +                loaded.add(name)
++        if self.visual is not None:
++            loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
 +        if missing := params.keys() - loaded:
 +            raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")
 +        return loaded
@@ -11319,6 +11386,342 @@ index 0000000..ab5de88
 +        D=width, BT=32, BD=128, num_warps=4,
 +    )
 +    return out
+diff --git a/vllm/models/inkling2/amd/ops/vision.py b/vllm/models/inkling2/amd/ops/vision.py
+new file mode 100644
+index 0000000..b87e1f8
+--- /dev/null
++++ b/vllm/models/inkling2/amd/ops/vision.py
+@@ -0,0 +1,330 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""ROCm Triton kernels for the Inkling2 vision encoder.
++
++Rows are tokens of the packed images (a CLS row, then the native patches in
++row-major order). Row metadata is int32 `[T, 4]`: native `(y, x)` and the
++native grid `(height, width)`, with `y = x = -1` on CLS rows. Outputs are
++rounded to bf16 at the same points as the eager PyTorch ops they replace.
++"""
++
++import functools
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++
++@functools.cache
++def _rope_inv_freq(head_dim: int, device: torch.device) -> torch.Tensor:
++    # Rounded from float64 to float32, matching the reference constants.
++    values = [10000.0 ** (-dim / head_dim) for dim in range(0, head_dim, 4)]
++    return torch.tensor(values, dtype=torch.float32, device=device)
++
++
++@triton.jit
++def _bf16(x):
++    # IEEE-754 round-to-nearest-even fp32 -> bf16 -> fp32 without PTX inline asm.
++    bits = x.to(tl.uint32, bitcast=True)
++    # Preserve NaNs; round normals/subnormals to nearest even.
++    is_nan = (bits & 0x7FFFFFFF) > 0x7F800000
++    rounding = 0x7FFF + ((bits >> 16) & 1)
++    rounded = tl.where(is_nan, bits | 0x00400000, bits + rounding) & 0xFFFF0000
++    return rounded.to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _layer_norm(x, w_ptr, b_ptr, cols, mask, DIM: tl.constexpr, eps):
++    # x is zero outside mask; fp32 statistics as in torch's LayerNorm.
++    mean = tl.sum(x) / DIM
++    diff = tl.where(mask, x - mean, 0.0)
++    rstd = tl.math.rsqrt(tl.sum(diff * diff) / DIM + eps)
++    w = tl.load(w_ptr + cols, mask=mask).to(tl.float32)
++    b = tl.load(b_ptr + cols, mask=mask).to(tl.float32)
++    return tl.fma(w, diff * rstd, b)
++
++
++@triton.jit
++def _gather_patches_kernel(
++    pixels_ptr,
++    offsets_ptr,
++    out_ptr,
++    mean0,
++    mean1,
++    mean2,
++    clip_std0,
++    clip_std1,
++    clip_std2,
++    std0,
++    std1,
++    std2,
++    SIDE: tl.constexpr,
++    PATCH: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    feature = tl.arange(0, BLOCK)
++    mask = feature < PATCH * PATCH * 3
++    channel = feature % 3
++    src = (
++        tl.load(offsets_ptr + row).to(tl.int64)
++        + (feature // (PATCH * 3)) * (SIDE * 3)
++        + feature % (PATCH * 3)
++    )
++    mean = tl.where(channel == 0, mean0, tl.where(channel == 1, mean1, mean2))
++    clip_std = tl.where(
++        channel == 0, clip_std0, tl.where(channel == 1, clip_std1, clip_std2)
++    )
++    std = tl.where(channel == 0, std0, tl.where(channel == 1, std1, std2))
++    value = tl.load(pixels_ptr + src, mask=mask).to(tl.float32)
++    value = _bf16(tl.div_rn(tl.div_rn(value, 255.0) - mean, clip_std))
++    value = 2.0 * (value * std + mean) - 1.0
++    tl.store(out_ptr + row * (PATCH * PATCH * 3) + feature, value, mask=mask)
++
++
++def gather_patches(
++    pixels: torch.Tensor,
++    offsets: torch.Tensor,
++    patch_size: int,
++    mean: tuple[float, float, float],
++    clip_std: tuple[float, float, float],
++    std: tuple[float, float, float],
++) -> torch.Tensor:
++    """Native patches of raw `[N, side, side, 3]` pixels as bf16 rows of
++    `(py, px, c)` values in [-1, 1].
++    """
++    _, side, _, channels = pixels.shape
++    assert channels == 3 and pixels.is_contiguous()
++    features = patch_size * patch_size * 3
++    out = pixels.new_empty((offsets.numel(), features))
++    _gather_patches_kernel[(offsets.numel(),)](
++        pixels,
++        offsets,
++        out,
++        *mean,
++        *clip_std,
++        *std,
++        SIDE=side,
++        PATCH=patch_size,
++        BLOCK=triton.next_power_of_2(features),
++        num_warps=4,
++    )
++    return out
++
++
++@triton.jit
++def _source_coords(index, target, SOURCE: tl.constexpr):
++    coord = tl.div_rn(float(SOURCE) * (index + 0.5), target) - 0.5
++    coord = tl.maximum(0.0, tl.minimum(coord, SOURCE - 1.0))
++    src0 = tl.floor(coord).to(tl.int64)
++    src1 = tl.minimum(src0 + 1, SOURCE - 1)
++    w1 = coord - src0.to(tl.float32)
++    return src0, src1, 1.0 - w1, w1
++
++
++@triton.jit
++def _lerp(a, b, wa, wb):
++    return tl.where(wa >= wb, tl.fma(a, wa, b * wb), tl.fma(b, wb, a * wa))
++
++
++@triton.jit(do_not_specialize=["eps"])
++def _embed_kernel(
++    patch_ptr,
++    patch_rows_ptr,
++    grid_ptr,
++    meta_ptr,
++    class_ptr,
++    cls_pos_ptr,
++    pre_w_ptr,
++    pre_b_ptr,
++    ln_w_ptr,
++    ln_b_ptr,
++    hidden_ptr,
++    normed_ptr,
++    eps,
++    SOURCE_HEIGHT: tl.constexpr,
++    SOURCE_WIDTH: tl.constexpr,
++    DIM: tl.constexpr,
++    BLOCK_DIM: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    dim = tl.arange(0, BLOCK_DIM)
++    mask = dim < DIM
++    meta = meta_ptr + row * 4
++    y = tl.load(meta)
++    if y < 0:
++        hidden = tl.load(class_ptr + dim, mask=mask).to(tl.float32)
++        hidden += tl.load(cls_pos_ptr + dim, mask=mask).to(tl.float32)
++    else:
++        x = tl.load(meta + 1).to(tl.float32)
++        height = tl.load(meta + 2).to(tl.float32)
++        width = tl.load(meta + 3).to(tl.float32)
++        y0, y1, wy0, wy1 = _source_coords(y.to(tl.float32), height, SOURCE_HEIGHT)
++        x0, x1, wx0, wx1 = _source_coords(x, width, SOURCE_WIDTH)
++        v00 = tl.load(grid_ptr + (y0 * SOURCE_WIDTH + x0) * DIM + dim, mask=mask)
++        v01 = tl.load(grid_ptr + (y0 * SOURCE_WIDTH + x1) * DIM + dim, mask=mask)
++        v10 = tl.load(grid_ptr + (y1 * SOURCE_WIDTH + x0) * DIM + dim, mask=mask)
++        v11 = tl.load(grid_ptr + (y1 * SOURCE_WIDTH + x1) * DIM + dim, mask=mask)
++        top = _lerp(v00.to(tl.float32), v01.to(tl.float32), wx0, wx1)
++        bottom = _lerp(v10.to(tl.float32), v11.to(tl.float32), wx0, wx1)
++        patch_row = tl.load(patch_rows_ptr + row).to(tl.int64)
++        hidden = tl.load(patch_ptr + patch_row * DIM + dim, mask=mask)
++        hidden = hidden.to(tl.float32) + _bf16(_lerp(top, bottom, wy0, wy1))
++    hidden = tl.where(mask, _bf16(hidden), 0.0)
++    hidden = _layer_norm(hidden, pre_w_ptr, pre_b_ptr, dim, mask, DIM, eps)
++    hidden = tl.where(mask, _bf16(hidden), 0.0)
++    tl.store(hidden_ptr + row * DIM + dim, hidden, mask=mask)
++    normed = _layer_norm(hidden, ln_w_ptr, ln_b_ptr, dim, mask, DIM, eps)
++    tl.store(normed_ptr + row * DIM + dim, normed, mask=mask)
++
++
++def embed_tokens(
++    patch_embeds: torch.Tensor,
++    patch_rows: torch.Tensor,
++    position_grid: torch.Tensor,
++    meta: torch.Tensor,
++    class_embedding: torch.Tensor,
++    cls_position_embedding: torch.Tensor,
++    ln_pre: torch.nn.LayerNorm,
++    ln_1: torch.nn.LayerNorm,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Returns `(hidden, ln_1(hidden))` with `hidden = ln_pre(embeddings)`."""
++    num_rows, dim = meta.shape[0], patch_embeds.shape[1]
++    assert ln_pre.eps == ln_1.eps
++    hidden = patch_embeds.new_empty((num_rows, dim))
++    normed = torch.empty_like(hidden)
++    _embed_kernel[(num_rows,)](
++        patch_embeds,
++        patch_rows,
++        position_grid,
++        meta,
++        class_embedding,
++        cls_position_embedding,
++        ln_pre.weight,
++        ln_pre.bias,
++        ln_1.weight,
++        ln_1.bias,
++        hidden,
++        normed,
++        ln_pre.eps,
++        SOURCE_HEIGHT=position_grid.shape[0],
++        SOURCE_WIDTH=position_grid.shape[1],
++        DIM=dim,
++        BLOCK_DIM=triton.next_power_of_2(dim),
++        num_warps=4,
++    )
++    return hidden, normed
++
++
++@triton.jit
++def _rotate_pair(even, odd, cos, sin):
++    return tl.fma(even, cos, -odd * sin), tl.fma(odd, cos, even * sin)
++
++
++@triton.jit
++def _rotary_qk_kernel(
++    qkv_ptr,
++    meta_ptr,
++    inv_freq_ptr,
++    stride_token,
++    NUM_HEADS: tl.constexpr,
++    HEAD_DIM: tl.constexpr,
++    BLOCK_HEADS: tl.constexpr,
++    BLOCK_PAIRS: tl.constexpr,
++):
++    token = tl.program_id(0).to(tl.int64)
++    head = tl.program_id(1) * BLOCK_HEADS + tl.arange(0, BLOCK_HEADS)[:, None]
++    pair = tl.arange(0, BLOCK_PAIRS)[None, :]
++    pair_mask = pair < HEAD_DIM // 2
++    mask = (head < NUM_HEADS) & pair_mask
++
++    inv_freq = tl.load(inv_freq_ptr + pair % (HEAD_DIM // 4), mask=pair_mask)
++    axis = tl.where(pair < HEAD_DIM // 4, 1, 0)
++    position = tl.load(meta_ptr + 4 * token + axis, mask=pair_mask, other=0) + 1
++    angle = position.to(tl.float32) * inv_freq
++    cos = tl.cos(angle)
++    sin = tl.sin(angle)
++
++    q_ptr = qkv_ptr + token * stride_token + head * HEAD_DIM + 2 * pair
++    k_ptr = q_ptr + NUM_HEADS * HEAD_DIM
++    q_even = tl.load(q_ptr, mask=mask, other=0.0).to(tl.float32)
++    q_odd = tl.load(q_ptr + 1, mask=mask, other=0.0).to(tl.float32)
++    k_even = tl.load(k_ptr, mask=mask, other=0.0).to(tl.float32)
++    k_odd = tl.load(k_ptr + 1, mask=mask, other=0.0).to(tl.float32)
++    q_even, q_odd = _rotate_pair(q_even, q_odd, cos, sin)
++    k_even, k_odd = _rotate_pair(k_even, k_odd, cos, sin)
++    tl.store(q_ptr, q_even, mask=mask)
++    tl.store(q_ptr + 1, q_odd, mask=mask)
++    tl.store(k_ptr, k_even, mask=mask)
++    tl.store(k_ptr + 1, k_odd, mask=mask)
++
++
++def apply_rotary_qk_(qkv: torch.Tensor, meta: torch.Tensor, num_heads: int) -> None:
++    """In-place interleaved 2D RoPE on the q and k thirds of `qkv [T, 3D]`."""
++    num_tokens, width = qkv.shape
++    head_dim = width // (3 * num_heads)
++    block_heads = min(4, triton.next_power_of_2(num_heads))
++    grid = (num_tokens, triton.cdiv(num_heads, block_heads))
++    _rotary_qk_kernel[grid](
++        qkv,
++        meta,
++        _rope_inv_freq(head_dim, qkv.device),
++        qkv.stride(0),
++        NUM_HEADS=num_heads,
++        HEAD_DIM=head_dim,
++        BLOCK_HEADS=block_heads,
++        BLOCK_PAIRS=triton.next_power_of_2(head_dim // 2),
++        num_warps=4,
++    )
++
++
++@triton.jit(do_not_specialize=["eps"])
++def _scaled_residual_norm_kernel(
++    hidden_ptr,
++    update_ptr,
++    gamma_ptr,
++    ln_w_ptr,
++    ln_b_ptr,
++    normed_ptr,
++    eps,
++    DIM: tl.constexpr,
++    BLOCK_DIM: tl.constexpr,
++    HAS_NORM: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    dim = tl.arange(0, BLOCK_DIM)
++    mask = dim < DIM
++    update = tl.load(update_ptr + row * DIM + dim, mask=mask).to(tl.float32)
++    gamma = tl.load(gamma_ptr + dim, mask=mask).to(tl.float32)
++    hidden = tl.load(hidden_ptr + row * DIM + dim, mask=mask).to(tl.float32)
++    hidden = tl.where(mask, _bf16(hidden + _bf16(update * gamma)), 0.0)
++    tl.store(hidden_ptr + row * DIM + dim, hidden, mask=mask)
++    if HAS_NORM:
++        normed = _layer_norm(hidden, ln_w_ptr, ln_b_ptr, dim, mask, DIM, eps)
++        tl.store(normed_ptr + row * DIM + dim, normed, mask=mask)
++
++
++def scaled_residual_norm_(
++    hidden: torch.Tensor,
++    update: torch.Tensor,
++    gamma: torch.Tensor,
++    norm: torch.nn.LayerNorm | None,
++) -> torch.Tensor | None:
++    """`hidden += update * gamma` in place; returns `norm(hidden)`."""
++    num_rows, dim = hidden.shape
++    assert hidden.is_contiguous() and update.is_contiguous()
++    normed = None if norm is None else torch.empty_like(hidden)
++    _scaled_residual_norm_kernel[(num_rows,)](
++        hidden,
++        update,
++        gamma,
++        None if norm is None else norm.weight,
++        None if norm is None else norm.bias,
++        normed,
++        0.0 if norm is None else norm.eps,
++        DIM=dim,
++        BLOCK_DIM=triton.next_power_of_2(dim),
++        HAS_NORM=norm is not None,
++        num_warps=4,
++    )
++    return normed
 diff --git a/vllm/models/inkling2/amd/sconv.py b/vllm/models/inkling2/amd/sconv.py
 new file mode 100644
 index 0000000..c24e534
@@ -11467,6 +11870,297 @@ index 0000000..c24e534
 +            residual,
 +            out,
 +        )
+diff --git a/vllm/models/inkling2/amd/vision.py b/vllm/models/inkling2/amd/vision.py
+new file mode 100644
+index 0000000..288e468
+--- /dev/null
++++ b/vllm/models/inkling2/amd/vision.py
+@@ -0,0 +1,285 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""ROCm Inkling2 vision encoder: PE-Lang-style ViT with a 2x2 merge adapter.
++
++Module names mirror the checkpoint, so `model.visual.<name>` loads into
++`Inkling2VisionEncoder.<name>` unchanged, except that each layer's
++`q_proj`/`k_proj`/`v_proj` load into one fused `qkv_proj`.
++"""
++
++from collections import Counter
++from collections.abc import Iterable, Mapping
++from typing import Any, NamedTuple
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++from torch import nn
++
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++from .ops.vision import (
++    apply_rotary_qk_,
++    embed_tokens,
++    gather_patches,
++    scaled_residual_norm_,
++)
++
++_CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
++_CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
++_PROCESSOR_CLIP_STD = (0.26862954, 0.2613026, 0.2757771)
++
++
++def _linear(in_features: int, out_features: int, bias: bool = True) -> nn.Linear:
++    return nn.Linear(in_features, out_features, bias=bias, dtype=torch.bfloat16)
++
++
++class VisionMetadata(NamedTuple):
++    meta: torch.Tensor
++    patch_rows: torch.Tensor
++    pixel_offsets: torch.Tensor
++    pool_rows: torch.Tensor
++    cu_seqlens: torch.Tensor
++    cu_seqlens_cpu: tuple[int, ...]
++    max_seqlen: int
++
++
++class Inkling2VisionAttention(nn.Module):
++    def __init__(self, width: int, num_heads: int) -> None:
++        super().__init__()
++        self.num_heads = num_heads
++        self.head_dim = width // num_heads
++        self.qkv_proj = _linear(width, 3 * width)
++        self.out_proj = _linear(width, width)
++
++    def forward(self, hidden: torch.Tensor, metadata: VisionMetadata) -> torch.Tensor:
++        qkv = self.qkv_proj(hidden)
++        apply_rotary_qk_(qkv, metadata.meta, self.num_heads)
++        q, k, v = qkv.view(-1, 3, self.num_heads, self.head_dim).unbind(1)
++        scale = self.head_dim**-0.5
++        cu = metadata.cu_seqlens_cpu
++        if len(cu) == 2:
++            # Fast single-image path: [1, H, S, D] -> ROCm Flash/MemEfficient SDPA
++            s0, s1 = cu[0], cu[1]
++            out = F.scaled_dot_product_attention(
++                q[s0:s1].transpose(0, 1).unsqueeze(0),
++                k[s0:s1].transpose(0, 1).unsqueeze(0),
++                v[s0:s1].transpose(0, 1).unsqueeze(0),
++                scale=scale,
++                is_causal=False,
++            )
++            out = out.squeeze(0).transpose(0, 1).contiguous().view(hidden.shape)
++        else:
++            out = torch.empty_like(q)
++            for s0, s1 in zip(cu[:-1], cu[1:]):
++                if s1 <= s0:
++                    continue
++                seg = F.scaled_dot_product_attention(
++                    q[s0:s1].transpose(0, 1).unsqueeze(0),
++                    k[s0:s1].transpose(0, 1).unsqueeze(0),
++                    v[s0:s1].transpose(0, 1).unsqueeze(0),
++                    scale=scale,
++                    is_causal=False,
++                )
++                out[s0:s1].copy_(seg.squeeze(0).transpose(0, 1))
++            out = out.view(hidden.shape)
++        return self.out_proj(out)
++
++
++class Inkling2VisionMLP(nn.Module):
++    def __init__(self, width: int, intermediate_size: int) -> None:
++        super().__init__()
++        self.c_fc = _linear(width, intermediate_size)
++        self.c_proj = _linear(intermediate_size, width)
++
++    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
++        return self.c_proj(F.gelu(self.c_fc(hidden)))
++
++
++class Inkling2VisionLayerScale(nn.Module):
++    def __init__(self, width: int) -> None:
++        super().__init__()
++        self.gamma = nn.Parameter(torch.empty(width, dtype=torch.bfloat16))
++
++
++class Inkling2VisionLayer(nn.Module):
++    def __init__(self, config: Mapping[str, Any]) -> None:
++        super().__init__()
++        width, eps = config["hidden_size"], config["layer_norm_eps"]
++        self.ln_1 = nn.LayerNorm(width, eps=eps, dtype=torch.bfloat16)
++        self.self_attn = Inkling2VisionAttention(width, config["num_attention_heads"])
++        self.ln_2 = nn.LayerNorm(width, eps=eps, dtype=torch.bfloat16)
++        self.mlp = Inkling2VisionMLP(width, int(width * config["mlp_ratio"]))
++        self.ls_1 = Inkling2VisionLayerScale(width)
++        self.ls_2 = Inkling2VisionLayerScale(width)
++
++    def forward(
++        self,
++        hidden: torch.Tensor,
++        normed: torch.Tensor,
++        metadata: VisionMetadata,
++        next_norm: nn.LayerNorm | None,
++    ) -> torch.Tensor | None:
++        attn = self.self_attn(normed, metadata)
++        normed = scaled_residual_norm_(hidden, attn, self.ls_1.gamma, self.ln_2)
++        mlp = self.mlp(normed)
++        return scaled_residual_norm_(hidden, mlp, self.ls_2.gamma, next_norm)
++
++
++class Inkling2VisionEmbeddings(nn.Module):
++    def __init__(self, config: Mapping[str, Any]) -> None:
++        super().__init__()
++        width, grid = config["hidden_size"], config["posemb_grid_size"]
++        self.patch_embedding = _linear(
++            3 * config["native_patch_size"] ** 2, width, bias=False
++        )
++        self.position_embedding = nn.Parameter(
++            torch.empty(grid * grid, width, dtype=torch.bfloat16)
++        )
++        self.class_embedding = nn.Parameter(torch.empty(width, dtype=torch.bfloat16))
++        self.cls_position_embedding = nn.Parameter(
++            torch.empty(width, dtype=torch.bfloat16)
++        )
++
++
++class Inkling2VisionBackbone(nn.Module):
++    def __init__(self, config: Mapping[str, Any]) -> None:
++        super().__init__()
++        self.embeddings = Inkling2VisionEmbeddings(config)
++        self.ln_pre = nn.LayerNorm(
++            config["hidden_size"], eps=config["layer_norm_eps"], dtype=torch.bfloat16
++        )
++        self.layers = nn.ModuleList(
++            Inkling2VisionLayer(config) for _ in range(config["num_hidden_layers"])
++        )
++
++
++class Inkling2VisionEncoder(nn.Module):
++    """Maps raw `[N, 40, 40, 3]` bf16 pixel patches to decoder embeddings."""
++
++    def __init__(self, config: Mapping[str, Any], text_hidden_size: int) -> None:
++        super().__init__()
++        self.patch_size = config["native_patch_size"]
++        self.merge_size = config["adapter_merge_size"]
++        self.posemb_grid_size = config["posemb_grid_size"]
++        self.text_hidden_size = text_hidden_size
++        self.backbone = Inkling2VisionBackbone(config)
++        self.proj_in = _linear(
++            self.merge_size**2 * config["hidden_size"],
++            config["projection_hidden_dim"],
++            bias=config["projector_bias"],
++        )
++        self.proj_out = _linear(
++            config["projection_hidden_dim"],
++            text_hidden_size,
++            bias=config["projector_bias"],
++        )
++
++    def metadata(self, grid: list[list[int]], device: torch.device) -> VisionMetadata:
++        m, p, side = self.merge_size, self.patch_size, self.merge_size * self.patch_size
++        frame = side * side * 3
++        meta, patch_rows, offsets, pool_rows, lengths = [], [], [], [], []
++        num_tokens = num_patches = num_pixels_rows = 0
++        for _, h, w in grid:
++            height, width = h * m, w * m
++            y, x = np.divmod(np.arange(height * width, dtype=np.int64), width)
++            image_meta = np.empty((height * width + 1, 4), np.int64)
++            image_meta[0, :2] = -1
++            image_meta[1:, 0], image_meta[1:, 1] = y, x
++            image_meta[:, 2], image_meta[:, 3] = height, width
++            meta.append(image_meta)
++            rows = np.arange(height * width + 1, dtype=np.int64) + num_pixels_rows - 1
++            rows[0] = 0
++            patch_rows.append(rows)
++            patch = num_patches + (y // m) * w + x // m
++            offsets.append(patch * frame + (y % m) * (p * side * 3) + (x % m) * (p * 3))
++            merged = (y // m) * (w * m * m) + (x // m) * (m * m) + (y % m) * m + x % m
++            pool = np.empty(height * width, np.int64)
++            pool[merged] = num_tokens + 1 + np.arange(height * width)
++            pool_rows.append(pool)
++            lengths.append(height * width + 1)
++            num_tokens += height * width + 1
++            num_patches += h * w
++            num_pixels_rows += height * width
++        cu_seqlens = np.cumsum([0, *lengths])
++        parts = [
++            np.concatenate(meta).ravel(),
++            *map(np.concatenate, (patch_rows, offsets, pool_rows)),
++            cu_seqlens,
++        ]
++        packed = np.concatenate(parts)
++        assert packed.max() < 2**31
++        packed_t = torch.from_numpy(packed.astype(np.int32)).to(device, non_blocking=True)
++        sizes = [part.size for part in parts]
++        meta_t, patch_rows_t, offsets_t, pool_t, cu_t = packed_t.split(sizes)
++        max_seqlen = max(257, num_tokens - len(lengths) + 1)
++        return VisionMetadata(
++            meta_t.view(-1, 4),
++            patch_rows_t,
++            offsets_t,
++            pool_t,
++            cu_t,
++            tuple(int(x) for x in cu_seqlens.tolist()),
++            max_seqlen,
++        )
++
++    def forward(self, pixels: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
++        side = self.patch_size * self.merge_size
++        assert pixels.dtype == torch.bfloat16
++        assert pixels.shape[1:] == (side, side, 3)
++        grid = grid_thw.tolist()
++        assert all(t == 1 for t, _, _ in grid)
++        assert sum(h * w for _, h, w in grid) == pixels.shape[0]
++        return self.encode(pixels, self.metadata(grid, pixels.device))
++
++    def encode(self, pixels: torch.Tensor, metadata: VisionMetadata) -> torch.Tensor:
++        backbone = self.backbone
++        embeddings = backbone.embeddings
++        patches = gather_patches(
++            pixels.contiguous(),
++            metadata.pixel_offsets,
++            self.patch_size,
++            _CLIP_MEAN,
++            _PROCESSOR_CLIP_STD,
++            _CLIP_STD,
++        )
++        g = self.posemb_grid_size
++        hidden, normed = embed_tokens(
++            embeddings.patch_embedding(patches),
++            metadata.patch_rows,
++            embeddings.position_embedding.view(g, g, -1),
++            metadata.meta,
++            embeddings.class_embedding,
++            embeddings.cls_position_embedding,
++            backbone.ln_pre,
++            backbone.layers[0].ln_1,
++        )
++        layers = backbone.layers
++        for i, layer in enumerate(layers):
++            next_norm = layers[i + 1].ln_1 if i + 1 < len(layers) else None
++            normed = layer(hidden, normed, metadata, next_norm)
++        pooled = hidden.index_select(0, metadata.pool_rows)
++        pooled = pooled.view(-1, self.merge_size**2 * hidden.shape[-1])
++        return self.proj_out(F.gelu(self.proj_in(pooled)))
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        """Load `model.visual.*` checkpoint tensors with that prefix stripped."""
++        params = dict(self.named_parameters())
++        loaded: set[str] = set()
++        qkv_shards: Counter[str] = Counter()
++        for name, weight in weights:
++            for shard, proj in enumerate(("q_proj", "k_proj", "v_proj")):
++                if f".self_attn.{proj}." in name:
++                    name = name.replace(proj, "qkv_proj")
++                    param = params[name]
++                    size = param.shape[0] // 3
++                    default_weight_loader(
++                        param.data[shard * size : (shard + 1) * size], weight
++                    )
++                    qkv_shards[name] += 1
++                    break
++            else:
++                if name not in params:
++                    raise ValueError(f"Unexpected vision checkpoint tensor: {name}")
++                default_weight_loader(params[name], weight)
++                loaded.add(name)
++        return loaded | {name for name, count in qkv_shards.items() if count == 3}
 diff --git a/vllm/models/inkling2/speculator.py b/vllm/models/inkling2/speculator.py
 index 6beae2b..8cad0b0 100644
 --- a/vllm/models/inkling2/speculator.py

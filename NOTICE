@@ -1,0 +1,22 @@
+Inkling 2 Mini — Ciru Strix Halo (gfx1151) Preview Runtime
+Copyright 2026 Ciru
+
+Ciru-authored overlay code, Triton kernels, packaging scripts, and
+documentation are provided under Apache License 2.0.
+
+Upstream model weights originate from Thinking Machines Lab:
+  thinkingmachines/Inkling-2-Mini (Apache-2.0)
+  Pinned revision: 6e7c8248f75265bdd4fbab5273304243b5d8c2cb
+
+Runtime integration builds on:
+  - vLLM (Apache-2.0), pinned baseline commit
+    b426b46e63408c41b0aec069fdaf24dd640abe58 (vllm-project/vllm#69028)
+  - Inkling 2 Small ROCm donor attention/conv patterns
+    (vllm-project/vllm#67685, commit a6aa3ad9e8b1a7f2c5800b41156f621a2390c62a)
+  - Hugging Face Transformers Inkling 2 Loop reference
+    (huggingface/transformers#51050, commit 6173a2f679ff4ed393afc499aefc569da7e68bc1)
+  - Triton (MIT), PyTorch (BSD-3-Clause), and AMD ROCm components under
+    their respective licenses.
+
+Thinking Machines Lab and AMD names and marks identify the upstream model
+and target hardware; this is an independent Ciru preview release.

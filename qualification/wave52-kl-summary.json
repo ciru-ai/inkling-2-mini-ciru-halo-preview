@@ -1,0 +1,55 @@
+{
+  "preview_version": "wave-5.2-preview",
+  "upstream_model": "thinkingmachines/Inkling-2-Mini",
+  "upstream_revision": "6e7c8248f75265bdd4fbab5273304243b5d8c2cb",
+  "upstream_vllm_base": "b426b46e63408c41b0aec069fdaf24dd640abe58",
+  "validated_platform": {
+    "os": "NixOS x86_64",
+    "gpu": "AMD Radeon 8060S (gfx1151, Strix Halo)",
+    "python": "3.12.12",
+    "torch": "2.13.0+rocm10.0.0",
+    "hip": "7.15.26333",
+    "triton": "3.8.0+git669b31ac",
+    "vllm": "0.34.0+rocm100"
+  },
+  "full_vocab_kl_audit": {
+    "scope": "teacher-forced prompt prefill and <=8-row vocabulary head, temperature 1",
+    "kl_direction": "publisher formats to tuned formats",
+    "vocab_size": 200058
+  },
+  "stock_source_mode_smoke": {
+    "order": {
+      "prompt_tokens": 53,
+      "completion_tokens": 162,
+      "ttft_s": 0.189,
+      "pp_tok_s": 280.42,
+      "dec_tok_s": 84.12
+    },
+    "math": {
+      "prompt_tokens": 55,
+      "completion_tokens": 1024,
+      "ttft_s": 0.2297,
+      "pp_tok_s": 239.41,
+      "dec_tok_s": 54.61
+    },
+    "code": {
+      "prompt_tokens": 42,
+      "completion_tokens": 349,
+      "ttft_s": 0.2122,
+      "pp_tok_s": 197.9,
+      "dec_tok_s": 69.79
+    },
+    "p3500": {
+      "prompt_tokens": 3900,
+      "completion_tokens": 32,
+      "ttft_s": 2.6095,
+      "pp_tok_s": 1494.55,
+      "dec_tok_s": 72.75
+    }
+  },
+  "stock_source_tool_smoke": {
+    "tool_name": "get_weather",
+    "completion_tokens": 71,
+    "dec_tok_s": 79.73
+  }
+}

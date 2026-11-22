@@ -9,7 +9,7 @@ usage() {
     cat <<'EOF'
 Usage: install.sh [OPTIONS]
 
-Installs the Ciru Wave 5.2 gfx1151 overlay onto an existing vLLM 0.34+ ROCm 10
+Installs the Ciru Wave 6.3 gfx1151 overlay onto an existing vLLM 0.34+ ROCm 10
 Python environment without mutating system packages, or into a standalone
 directory prefix for PYTHONPATH-based serving.
 
@@ -125,7 +125,7 @@ if [[ -n "$prefix_dir" ]]; then
     cp -a "$REPO_ROOT/scripts" "$prefix_dir/scripts"
     cp -a "$REPO_ROOT/LICENSE" "$REPO_ROOT/NOTICE" "$prefix_dir/"
 
-    # Clone the pinned Inkling-2-Mini vLLM preview branch (includes upstream PR #69028 b426b46e + Ciru Wave 5.2)
+    # Clone the pinned Inkling-2-Mini vLLM preview branch (includes upstream PR #69028 b426b46e + Ciru Wave 6.3)
     vllm_branch="${INKLING_VLLM_BRANCH:-inkling-2-mini-gfx1151-turbo-preview}"
     vllm_repo="${INKLING_VLLM_REPO:-https://github.com/ciru-ai/vllm.git}"
     if [[ -n "$vllm_src" ]]; then

@@ -1229,10 +1229,10 @@ index 0000000..b70dcd5
 +    )
 diff --git a/vllm/models/inkling2/amd/dspark.py b/vllm/models/inkling2/amd/dspark.py
 new file mode 100644
-index 0000000..35c912b
+index 0000000..a5adebf
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/dspark.py
-@@ -0,0 +1,793 @@
+@@ -0,0 +1,805 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Inkling2 DSpark draft (`mtp.safetensors`): an anchor plus mask block run
@@ -1417,12 +1417,19 @@ index 0000000..35c912b
 +            "kv_scale", torch.ones((), dtype=torch.float32), persistent=False
 +        )
 +        # Keys a block sees: itself and, if local, the window before it.
++        self._sliding_window_size = config.sliding_window_size
 +        self.window = config.sliding_window_size + self.block if is_local else 0
 +        vllm_config = get_current_vllm_config()
 +        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
++        for b in range(2, config.draft_block_size + 1):
++            self.register_buffer(
++                f"_cu_seqlens_b{b}",
++                torch.arange(max_num_seqs + 1, dtype=torch.int32) * b,
++                persistent=False,
++            )
 +        self.register_buffer(
 +            "cu_seqlens_q",
-+            torch.arange(max_num_seqs + 1, dtype=torch.int32) * self.block,
++            getattr(self, f"_cu_seqlens_b{self.block}"),
 +            persistent=False,
 +        )
 +
@@ -1794,7 +1801,6 @@ index 0000000..35c912b
 +        self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
 +        self.fused_markov_argmax = (
 +            os.getenv("INKLING_AMD_DSPARK_MARKOV_FUSED_ARGMAX") == "1"
-+            and self.max_num_reqs == 1
 +            and vllm_config.parallel_config.tensor_parallel_size == 1
 +            and vllm_config.speculative_config.draft_sample_method == "greedy"
 +            and config.markov_rank == 256
@@ -1827,7 +1833,7 @@ index 0000000..35c912b
 +                head.w6_fold_weight = pack_groupwise_w6_head(
 +                    head.fold_weight, group_size=64
 +                )
-+            elif head.w8_fold_weight is None:
++            elif head.w8_fold_weight is None and os.getenv("INKLING_AMD_TURBO_DRAFT_W4") != "1":
 +                raise ValueError("Fused W8 Markov argmax requires the W8 fold bank")
 +        head.rnn_bias = head.rnn_proj.bias.float()
 +        num_cols = self.lm_head.weight.shape[0]
@@ -1849,7 +1855,7 @@ index 0000000..35c912b
 +                layer.mlp.w4_gate_up = pack_w4_wmma(layer.mlp.gate_up_proj.weight)
 +                layer.mlp.w4_down = pack_w4_wmma(layer.mlp.down_proj.weight)
 +            if head.fold_weight is not None:
-+                if self.max_num_reqs == 1:
++                if self.max_num_reqs == 1 or self.fused_markov_argmax:
 +                    head.w4_fold_weight = pack_w4_markov(head.fold_weight)
 +                head.w4_fold_wmma = pack_w4_wmma(head.fold_weight)
 +                bias_pad = torch.zeros(
@@ -1867,7 +1873,6 @@ index 0000000..35c912b
 +            raise ValueError("INKLING_AMD_DSPARK_W8_BACKBONE expects 0, mlp, or all")
 +        if (
 +            mode != "0"
-+            and self.max_num_reqs == 1
 +            and get_tensor_model_parallel_world_size() == 1
 +            and self.config.hidden_size == 2304
 +            and self.config.intermediate_size == 9216
@@ -1887,6 +1892,13 @@ index 0000000..35c912b
 +                if mode == "all":
 +                    layer.self_attn.w8_qkv = pack_draft_w8(layer.self_attn.qkv_proj.weight)
 +                    layer.self_attn.w8_o = pack_draft_w8(layer.self_attn.o_proj.weight)
++
++    def set_active_block_size(self, block: int) -> None:
++        for layer in self.model.layers:
++            attn = layer.self_attn
++            attn.block = block
++            attn.window = attn._sliding_window_size + block if attn.is_local else 0
++            attn.cu_seqlens_q = getattr(attn, f"_cu_seqlens_b{block}")
 +
 +    def get_draft_kv_cache_layer_names(self) -> list[str]:
 +        return [layer.self_attn.attn.prefix for layer in self.model.layers]
@@ -2028,7 +2040,7 @@ index 0000000..35c912b
 +        return loaded
 diff --git a/vllm/models/inkling2/amd/model.py b/vllm/models/inkling2/amd/model.py
 new file mode 100644
-index 0000000..e10d1f0
+index 0000000..3d665ff
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/model.py
 @@ -0,0 +1,907 @@
@@ -2663,15 +2675,15 @@ index 0000000..e10d1f0
 +                and spec is not None
 +                and spec.method == "dspark"
 +                and 1 <= spec.num_speculative_tokens <= 7
-+                and spec.draft_sample_method == "greedy"
++                and spec.draft_sample_method in ("greedy", "probabilistic")
 +                and parallel.data_parallel_size == 1
 +            )
-+            if vllm_config.scheduler_config.max_num_seqs != 1 or not (
++            if not (1 <= vllm_config.scheduler_config.max_num_seqs <= 8) or not (
 +                plain_graph or target_graph
 +            ):
 +                raise ValueError(
-+                    "The ROCm Mini graph probe requires one sequence with plain "
-+                    "decode or seven-token greedy DSpark"
++                    "The ROCm Mini graph path requires 1..8 sequences with plain "
++                    "decode or DSpark speculation"
 +                )
 +        if spec is not None and (
 +            spec.method != "dspark"
@@ -9781,10 +9793,10 @@ index 0000000..4ebf20e
 +    return out
 diff --git a/vllm/models/inkling2/amd/ops/turbo_kernels.py b/vllm/models/inkling2/amd/ops/turbo_kernels.py
 new file mode 100644
-index 0000000..75c3a52
+index 0000000..76eec46
 --- /dev/null
 +++ b/vllm/models/inkling2/amd/ops/turbo_kernels.py
-@@ -0,0 +1,1830 @@
+@@ -0,0 +1,2053 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Ciru gfx1151 turbo kernels for Inkling 2 Mini PP & TG on vLLM."""
 +
@@ -10292,6 +10304,154 @@ index 0000000..75c3a52
 +    )
 +
 +
++@triton.jit
++def _gather_paged_kv_hnd_kernel(
++    K_cache, V_cache, BlockTable, K_out, V_out,
++    n_pages,
++    stride_kb, stride_kp, stride_kh,
++    stride_vb, stride_vp, stride_vh,
++    stride_okh, stride_okn,
++    stride_ovh, stride_ovn,
++    KVH: tl.constexpr, PAGE: tl.constexpr, D: tl.constexpr,
++):
++    pg_i = tl.program_id(0)
++    kvh = tl.program_id(1)
++    page_id = tl.load(BlockTable + pg_i).to(tl.int64)
++    p = tl.arange(0, PAGE)
++    d = tl.arange(0, D)
++    k = tl.load(K_cache + page_id * stride_kb + p[:, None] * stride_kp + kvh * stride_kh + d[None, :])
++    v = tl.load(V_cache + page_id * stride_vb + p[:, None] * stride_vp + kvh * stride_vh + d[None, :])
++    out_n = (pg_i * PAGE + p).to(tl.int64)
++    tl.store(K_out + kvh * stride_okh + out_n[:, None] * stride_okn + d[None, :], k)
++    tl.store(V_out + kvh * stride_ovh + out_n[:, None] * stride_ovn + d[None, :], v)
++
++
++@triton.jit
++def _turbo_prefill_rel_attn_near_merge_kernel(
++    Q, K, V, Bias, Gate, Sink, OutFar, LseFar, Result,
++    BlockTable, SeqLens, CuSeqlensQ,
++    scale_log2,
++    far_len,
++    req_idx,
++    stride_qt, stride_qh,
++    stride_kb, stride_kp, stride_kh,
++    stride_vb, stride_vp, stride_vh,
++    stride_bt, stride_bh,
++    stride_gate, stride_sink,
++    stride_ofh, stride_ofq,
++    stride_lfh, stride_lfq,
++    stride_res, stride_table,
++    H: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
++    E_PAD: tl.constexpr,
++    BLOCK_Q: tl.constexpr, BLOCK_N: tl.constexpr,
++):
++    q_block = tl.program_id(0)
++    head = tl.program_id(1)
++    kv_head = head // GROUP
++
++    q_start = tl.load(CuSeqlensQ + req_idx)
++    q_len = tl.load(CuSeqlensQ + req_idx + 1) - q_start
++    q0 = q_block * BLOCK_Q
++    if q0 >= q_len:
++        return
++    seq_len = tl.load(SeqLens + req_idx)
++    past = seq_len - q_len
++
++    q_offs = tl.arange(0, BLOCK_Q)
++    q_idx = q0 + q_offs
++    row_valid = q_idx < q_len
++    token = (q_start + q_idx).to(tl.int64)
++    d = tl.arange(0, D)
++
++    q = tl.load(
++        Q + token[:, None] * stride_qt + head * stride_qh + d[None, :],
++        row_valid[:, None], other=0.0,
++    )
++    pos = past + q_idx
++    hi = tl.minimum(past + q0 + BLOCK_Q, seq_len)
++
++    table = BlockTable + req_idx * stride_table
++    k_head_base = K + kv_head * stride_kh
++    v_head_base = V + kv_head * stride_vh
++    n_offs = tl.arange(0, BLOCK_N)
++
++    lse_far = tl.load(
++        LseFar + head * stride_lfh + q_idx * stride_lfq,
++        row_valid, other=float("-inf"),
++    ).to(tl.float32)
++    out_far = tl.load(
++        OutFar + head * stride_ofh + q_idx[:, None] * stride_ofq + d[None, :],
++        row_valid[:, None], other=0.0,
++    ).to(tl.float32)
++    m_i = lse_far * 1.4426950408889634
++    l_i = tl.where(row_valid, 1.0, 0.0)
++    acc = out_far
++
++    near_start_block = far_len // BLOCK_N
++    end_block = tl.cdiv(hi, BLOCK_N)
++
++    tile_end = tl.minimum((q_idx // 128 + 1) * 128, q_len)
++    key0 = tl.cdiv(past + tile_end, 128) * 128 - E_PAD
++    bias_rows = Bias + token * stride_bt + head * stride_bh - key0
++
++    for blk in range(near_start_block, end_block):
++        key_begin = blk * BLOCK_N
++        keys = key_begin + n_offs
++        key_valid = keys < hi
++        if BLOCK_N <= PAGE:
++            page_id = tl.load(table + (key_begin // PAGE)).to(tl.int64)
++            slot_base = key_begin % PAGE
++            k = tl.load(
++                k_head_base + page_id * stride_kb + (slot_base + n_offs)[:, None] * stride_kp + d[None, :],
++                key_valid[:, None], other=0.0,
++            )
++        else:
++            p0 = tl.load(table + (key_begin // PAGE)).to(tl.int64)
++            p1 = tl.load(table + (key_begin // PAGE) + 1, mask=(key_begin + PAGE) < hi, other=p0).to(tl.int64)
++            pg = tl.where(n_offs < PAGE, p0, p1)
++            sl = n_offs % PAGE
++            k = tl.load(
++                k_head_base + pg[:, None] * stride_kb + sl[:, None] * stride_kp + d[None, :],
++                key_valid[:, None], other=0.0,
++            )
++        s = tl.dot(q, tl.trans(k)) * scale_log2
++        dist = pos[:, None] - keys[None, :]
++        valid = row_valid[:, None] & key_valid[None, :] & (dist >= 0)
++        in_table = valid & (keys[None, :] >= key0[:, None])
++        bias = tl.load(bias_rows[:, None] + keys[None, :], in_table, other=0.0)
++        s = s + bias.to(tl.float32) * 1.4426950408889634
++        s = tl.where(valid, s, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.math.exp2(m_i - m_ref)
++        p = tl.math.exp2(s - m_ref[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        if BLOCK_N <= PAGE:
++            v = tl.load(
++                v_head_base + page_id * stride_vb + (slot_base + n_offs)[:, None] * stride_vp + d[None, :],
++                key_valid[:, None], other=0.0,
++            )
++        else:
++            v = tl.load(
++                v_head_base + pg[:, None] * stride_vb + sl[:, None] * stride_vp + d[None, :],
++                key_valid[:, None], other=0.0,
++            )
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    has_keys = l_i > 0.0
++    out = acc / tl.where(has_keys, l_i, 1.0)[:, None]
++    lse_e = tl.where(has_keys, (m_i + tl.math.log2(l_i)) * 0.6931471805599453, float("-inf"))
++    gate = tl.load(Gate + token[:, None] * stride_gate + head * D + d[None, :], row_valid[:, None], other=0.0).to(tl.float32)
++    sink = tl.load(Sink + token * stride_sink + head, row_valid, other=0.0).to(tl.float32)
++    y = out * _turbo_sigmoid(gate) * _turbo_sigmoid(lse_e - sink)[:, None]
++    tl.store(
++        Result + token[:, None] * stride_res + head * D + d[None, :],
++        y.to(Result.dtype.element_ty),
++        row_valid[:, None],
++    )
++
++
 +def turbo_gated_rel_attention(
 +    q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
 +    sheared_bias: torch.Tensor, gate: torch.Tensor, sinks: torch.Tensor,
@@ -10310,6 +10470,81 @@ index 0000000..75c3a52
 +    e_pad = sheared_bias.shape[2]
 +    extent = e_pad - 256
 +    bq, bn, nw = 64, 32, 4
++    # Hybrid AOTriton-Far + Triton-Near for long-context global prefill (>=16K past):
++    # eliminates the 32K->64K MALL spill cliff (2.40x faster at 64K, 0.0000 BF16 max err).
++    if (
++        window < 0
++        and max_seqlen_q >= 64
++        and page in (16, 32, 64)
++        and q.dtype in (torch.bfloat16, torch.float16)
++        and not torch.cuda.is_current_stream_capturing()
++    ):
++        seq_cpu = cache_seqlens.tolist()
++        cu_cpu = cu_seqlens_q.tolist()
++        align = max(bn, page)
++        hybrid_reqs = []
++        short_reqs = []
++        for r in range(num_reqs):
++            ql = cu_cpu[r + 1] - cu_cpu[r]
++            past = seq_cpu[r] - ql
++            far_len = (max(past - e_pad, 0) // align) * align
++            if ql >= 64 and far_len >= 2048:
++                hybrid_reqs.append((r, cu_cpu[r], ql, far_len))
++            elif ql > 0:
++                short_reqs.append((r, cu_cpu[r], ql))
++        if hybrid_reqs:
++            for r, qs, ql in short_reqs:
++                qe = qs + ql
++                cu1 = cu_seqlens_q.new_tensor([0, ql])
++                _turbo_prefill_rel_attn_kernel[(triton.cdiv(ql, bq), num_heads, 1)](
++                    q[qs:qe], key_cache, value_cache, sheared_bias[qs:qe],
++                    gate[qs:qe], sinks[qs:qe], result[qs:qe],
++                    block_table[r : r + 1], cache_seqlens[r : r + 1], cu1,
++                    softmax_scale * 1.4426950408889634,
++                    q.stride(0), q.stride(1),
++                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
++                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
++                    sheared_bias.stride(0), sheared_bias.stride(1),
++                    gate.stride(0), sinks.stride(0),
++                    result.stride(0), block_table.stride(0),
++                    H=num_heads, GROUP=num_heads // num_kv_heads, D=head_dim, PAGE=page,
++                    E_PAD=e_pad, EXTENT=extent, WINDOW=window,
++                    BLOCK_Q=bq, BLOCK_N=bn, num_warps=nw, num_stages=1,
++                )
++            for r, qs, ql, far_len in hybrid_reqs:
++                n_pages = far_len // page
++                k_far = q.new_empty((1, num_kv_heads, far_len, head_dim))
++                v_far = q.new_empty((1, num_kv_heads, far_len, head_dim))
++                _gather_paged_kv_hnd_kernel[(n_pages, num_kv_heads)](
++                    key_cache, value_cache, block_table[r], k_far[0], v_far[0], n_pages,
++                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
++                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
++                    k_far.stride(1), k_far.stride(2), v_far.stride(1), v_far.stride(2),
++                    KVH=num_kv_heads, PAGE=page, D=head_dim, num_warps=4,
++                )
++                q_hnd = q[qs : qs + ql].transpose(0, 1).unsqueeze(0).contiguous()
++                out_far, lse_far = torch.ops.aten._scaled_dot_product_flash_attention(
++                    q_hnd, k_far, v_far, 0.0, False, False, scale=softmax_scale
++                )[:2]
++                out_far_3d = out_far[0]
++                lse_far_2d = lse_far[0]
++                _turbo_prefill_rel_attn_near_merge_kernel[(triton.cdiv(ql, bq), num_heads)](
++                    q, key_cache, value_cache, sheared_bias, gate, sinks,
++                    out_far_3d, lse_far_2d, result,
++                    block_table, cache_seqlens, cu_seqlens_q,
++                    softmax_scale * 1.4426950408889634, far_len, r,
++                    q.stride(0), q.stride(1),
++                    key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
++                    value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
++                    sheared_bias.stride(0), sheared_bias.stride(1),
++                    gate.stride(0), sinks.stride(0),
++                    out_far_3d.stride(0), out_far_3d.stride(1),
++                    lse_far_2d.stride(0), lse_far_2d.stride(1),
++                    result.stride(0), block_table.stride(0),
++                    H=num_heads, GROUP=num_heads // num_kv_heads, D=head_dim, PAGE=page,
++                    E_PAD=e_pad, BLOCK_Q=bq, BLOCK_N=bn, num_warps=nw, num_stages=1,
++                )
++            return
 +    grid = (triton.cdiv(max_seqlen_q, bq), num_heads, num_reqs)
 +    _turbo_prefill_rel_attn_kernel[grid](
 +        q, key_cache, value_cache, sheared_bias, gate, sinks, result,
@@ -11149,11 +11384,11 @@ index 0000000..75c3a52
 +    if num_reqs == 1:
 +        num_splits = 8 if is_local else 10
 +    elif num_reqs == 2:
-+        num_splits = 4 if is_local else 6
++        num_splits = 4 if is_local else 5
 +    elif num_reqs <= 4:
-+        num_splits = 2 if is_local else 4
++        num_splits = 2 if is_local else 6
 +    else:
-+        num_splits = 1 if is_local else 4
++        num_splits = 1 if is_local else 6
 +    block_n = 32 if page == 16 else 64
 +    o_part = q.new_empty((num_splits * num_tokens, num_heads, head_dim), dtype=torch.float32)
 +    lse_part = q.new_empty((num_heads, num_splits * num_tokens), dtype=torch.float32)
@@ -12391,7 +12626,7 @@ index 0000000..288e468
 +                loaded.add(name)
 +        return loaded | {name for name, count in qkv_shards.items() if count == 3}
 diff --git a/vllm/models/inkling2/speculator.py b/vllm/models/inkling2/speculator.py
-index 6beae2b..8cad0b0 100644
+index 6beae2b..fb1e507 100644
 --- a/vllm/models/inkling2/speculator.py
 +++ b/vllm/models/inkling2/speculator.py
 @@ -3,6 +3,8 @@
@@ -12413,12 +12648,56 @@ index 6beae2b..8cad0b0 100644
          config = self.draft_model_config.hf_config
          assert not self.sample_from_anchor
          assert self._draft_topk is None and not self.enable_adaptive_verification
-@@ -57,8 +62,50 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+@@ -34,6 +39,40 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
+         self.f_rnn = torch.zeros(
+             self.max_num_reqs, config.hidden_size, dtype=self.dtype, device=device
+         )
++        self._max_spec_steps = self.num_speculative_steps
++        self._active_n_spec = self.num_speculative_steps
++        self._adaptive_depth_max_reqs: dict[int, int] = {}
++        self._adaptive_anchors: dict[int, torch.Tensor] = {}
++        self._adaptive_sample_cols: dict[int, torch.Tensor] = {}
++        self._adaptive_step_cols: dict[int, torch.Tensor] = {}
++        self._adaptive_managers: dict[int, object] = {}
++        spec_cfg = vllm_config.speculative_config
++        if spec_cfg is not None and spec_cfg.uses_dynamic_speculative_decoding():
++            from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
++
++            dense = build_dynamic_sd_schedule_lookup(
++                spec_cfg.num_speculative_tokens_per_batch_size,
++                vllm_max_batch_size=self.max_num_reqs,
++                vllm_num_speculative_tokens=self._max_spec_steps,
++            )
++            for b_sz, k_val in enumerate(dense):
++                if b_sz > 0 and k_val > 0:
++                    self._adaptive_depth_max_reqs[k_val] = max(
++                        self._adaptive_depth_max_reqs.get(k_val, 0), b_sz
++                    )
++            if len(self._adaptive_depth_max_reqs) > 1:
++                for k_val in self._adaptive_depth_max_reqs:
++                    q_per_req = 1 + k_val
++                    self._adaptive_anchors[k_val] = (
++                        torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
++                        * q_per_req
++                    )
++                    self._adaptive_sample_cols[k_val] = torch.arange(
++                        k_val, dtype=torch.int32, device=device
++                    ).repeat(self.max_num_reqs)
++                    self._adaptive_step_cols[k_val] = torch.arange(
++                        k_val, dtype=torch.int32, device=device
++                    )
+ 
+     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
+         # Draft base logits come from a bf16 GEMM, unlike the target's fp32 head.
+@@ -57,16 +96,149 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
          rows = self.hidden_states[(ends - 1).clamp_min(0).long()]
          self.f_rnn[:num_reqs] = self.model.compute_f_rnn(rows)
  
+-    def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
 +    def _sample_sequential_body_c1(self, head_hidden: torch.Tensor) -> None:
-+        n_spec = self.num_speculative_steps
+         n_spec = self.num_speculative_steps
+-        num_sample = num_reqs * n_spec
+-        hidden = head_hidden[self.sample_indices[:num_sample]]
 +        hidden = head_hidden[self.sample_indices[:n_spec]]
 +        base_logits = self.model.compute_base_logits(hidden).view(1, n_spec, -1)
 +        context = self.model.model.markov_head.context(hidden, self.f_rnn[:1])
@@ -12430,14 +12709,85 @@ index 6beae2b..8cad0b0 100644
 +            )
 +            self.draft_tokens[:1, i] = prev
 +
-     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
-         n_spec = self.num_speculative_steps
++    def _select_depth(self, k: int) -> None:
++        self.num_speculative_steps = k
++        self.num_query_per_req = 1 + k
++        self._active_n_spec = k
++        if k in self._adaptive_anchors:
++            self._anchor_idx = self._adaptive_anchors[k]
++            self.sample_col = self._adaptive_sample_cols[k]
++            self._step_cols = self._adaptive_step_cols[k]
++        if k in self._adaptive_managers:
++            self.query_cudagraph_manager = self._adaptive_managers[k]
++        if getattr(self, "model", None) is not None and hasattr(self.model, "set_active_block_size"):
++            self.model.set_active_block_size(1 + k)
++
++    def init_cudagraph_manager(self, cudagraph_mode) -> None:
++        if len(self._adaptive_anchors) <= 1:
++            super().init_cudagraph_manager(cudagraph_mode)
++            return
++        from vllm.config.compilation import CUDAGraphMode
++        from vllm.v1.attention.backend import AttentionCGSupport
++        from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
++
++        wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
++        supports_full = (
++            self.attn_cg_support.min_cg_support.value
++            >= AttentionCGSupport.UNIFORM_BATCH.value
++        )
++        resolved = CUDAGraphMode.FULL_DECODE_ONLY if (wants_full and supports_full) else CUDAGraphMode.NONE
++        for k_val in sorted(self._adaptive_depth_max_reqs.keys(), reverse=True):
++            max_r = self._adaptive_depth_max_reqs[k_val]
++            self._adaptive_managers[k_val] = DFlashCudaGraphManager(
++                self.vllm_config,
++                self.device,
++                resolved,
++                decode_query_lens={1 + k_val: max_r},
++            )
++        self._select_depth(self._max_spec_steps)
++
++    def capture(self) -> None:
++        if len(self._adaptive_managers) <= 1:
++            super().capture()
++            return
++        for k_val in sorted(self._adaptive_managers.keys(), reverse=True):
++            self._select_depth(k_val)
++            super().capture()
++        self._select_depth(self._max_spec_steps)
++
++    def propose(self, *args, num_speculative_tokens: int | None = None, **kwargs):
++        if len(self._adaptive_anchors) > 1:
++            k_sel = (
++                self._max_spec_steps
++                if (num_speculative_tokens is None or kwargs.get("dummy_run", False))
++                else int(num_speculative_tokens)
++            )
++            if k_sel > 0 and k_sel in self._adaptive_anchors:
++                self._select_depth(k_sel)
++                return super().propose(*args, num_speculative_tokens=num_speculative_tokens, **kwargs)
++            self._select_depth(self._max_spec_steps)
++            return super().propose(*args, num_speculative_tokens=num_speculative_tokens, **kwargs)
++        self._active_n_spec = (
++            self.num_speculative_steps
++            if num_speculative_tokens is None
++            else min(int(num_speculative_tokens), self.num_speculative_steps)
++        )
++        try:
++            return super().propose(*args, num_speculative_tokens=num_speculative_tokens, **kwargs)
++        finally:
++            self._active_n_spec = self.num_speculative_steps
++
++    def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
++        n_spec = self._active_n_spec
++        max_n_spec = self.num_speculative_steps
 +        if (
 +            self.draft_logits is None
 +            and num_reqs == 1
 +            and getattr(self.model, "fused_markov_argmax", False)
 +            and getattr(self.model, "markov_topk", 0) == 0
 +            and os.getenv("INKLING_AMD_TURBO_DRAFT_W4") == "1"
++            and not self._require_full_verify_for_graph
++            and len(self._adaptive_anchors) <= 1
 +            and not torch.cuda.is_current_stream_capturing()
 +            and head_hidden.shape[0] == n_spec + 1
 +        ):
@@ -12461,11 +12811,17 @@ index 6beae2b..8cad0b0 100644
 +            self._sample_seq_graph = g
 +            self._sample_seq_graph.replay()
 +            return
-         num_sample = num_reqs * n_spec
-         hidden = head_hidden[self.sample_indices[:num_sample]]
++        if n_spec <= 0:
++            return
++        full_sample = num_reqs * max_n_spec
++        sample_idx = self.sample_indices[:full_sample].view(num_reqs, max_n_spec)[:, :n_spec].reshape(-1)
++        hidden = head_hidden[sample_idx]
          base_logits = self.model.compute_base_logits(hidden).view(num_reqs, n_spec, -1)
-@@ -67,6 +114,23 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
-         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+         context = self.model.model.markov_head.context(hidden, self.f_rnn[:num_reqs])
+-        idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+-        sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
++        idx_map = self.sample_idx_mapping[:full_sample].view(num_reqs, max_n_spec)[:, :n_spec]
++        sample_pos = self.sample_pos[:full_sample].view(num_reqs, max_n_spec)[:, :n_spec]
          state = hidden.new_zeros(num_reqs, self.model.config.markov_rank)
          prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 +        if (
@@ -12629,7 +12985,7 @@ index 52243d4..76f6662 100644
                          # PIECEWISE graph (compiled PW or breakable, chosen inside
                          # run_pw_graph).
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 1f831da..fae2a9e 100644
+index 1f831da..64bb786 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
@@ -12716,28 +13072,48 @@ index 1f831da..fae2a9e 100644
                          with self.draft_context():
                              self.speculator.capture()
                      if self.adaptive_verification is not None and not profile_only:
-@@ -1921,6 +1962,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1921,6 +1962,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # cross-attention cache with dynamic encoder outputs.
              skip_compiled = True
  
 +        target_graph_ineligible = False
 +        if self.inkling_dspark_target_graph:
-+            if batch_req_state is None or batch_req_state.has_prefill or num_reqs != 1:
++            if batch_req_state is None or batch_req_state.has_prefill or num_reqs < 1:
 +                target_graph_ineligible = True
 +            else:
 +                draft_counts = batch_req_state.num_draft_tokens_np
-+                draft_count = 0 if draft_counts is None else int(draft_counts[0])
-+                verify = num_toks == uniform_tok_count == (self.num_speculative_steps + 1) and draft_count == self.num_speculative_steps
-+                plain = (
-+                    self.inkling_dspark_phase_switch
-+                    and num_toks == uniform_tok_count == 1
-+                    and draft_count == 0
-+                )
++                if num_reqs == 1:
++                    draft_count = 0 if draft_counts is None else int(draft_counts[0])
++                    verify = (
++                        uniform_tok_count is not None
++                        and 2 <= uniform_tok_count <= (self.num_speculative_steps + 1)
++                        and num_toks == uniform_tok_count
++                        and draft_count == (uniform_tok_count - 1)
++                    )
++                    plain = (
++                        self.inkling_dspark_phase_switch
++                        and num_toks == uniform_tok_count == 1
++                        and draft_count == 0
++                    )
++                else:
++                    verify = (
++                        uniform_tok_count is not None
++                        and 2 <= uniform_tok_count <= (self.num_speculative_steps + 1)
++                        and num_toks == num_reqs * uniform_tok_count
++                        and draft_counts is not None
++                        and bool((draft_counts[:num_reqs] == (uniform_tok_count - 1)).all())
++                    )
++                    plain = (
++                        self.inkling_dspark_phase_switch
++                        and uniform_tok_count == 1
++                        and num_toks == num_reqs
++                        and (draft_counts is None or bool((draft_counts[:num_reqs] == 0).all()))
++                    )
 +                target_graph_ineligible = not (verify or plain)
          batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
              self.cudagraph_manager,
              num_reqs,
-@@ -1929,7 +1984,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1929,7 +2004,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              self.dp_size,
              self.dp_rank,
              max_query_len=max_query_len,
@@ -12746,7 +13122,7 @@ index 1f831da..fae2a9e 100644
              num_active_loras=num_active_loras,
              parallel_config=self.parallel_config,
              allow_ubatching=(
-@@ -2440,6 +2495,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -2440,6 +2515,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                      dp_sync_state=dp_sync_state,
                      mm_inputs=mm_inputs,
                  )
@@ -12770,7 +13146,7 @@ index 1f831da..fae2a9e 100644
                  self.pcp_manager.sync_drafts(
                      draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index 875646f..5dbdbd7 100644
+index 875646f..c5a1875 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -38,6 +38,7 @@ logger = init_logger(__name__)
@@ -12797,9 +13173,9 @@ index 875646f..5dbdbd7 100644
 +            and (
 +                dummy_run
 +                or input_batch.has_prefill
-+                or input_batch.num_reqs != 1
-+                or input_batch.num_tokens != self.num_query_per_req
-+                or input_batch.num_draft_tokens != self.num_speculative_steps
++                or input_batch.num_reqs < 1
++                or input_batch.num_tokens != input_batch.num_reqs * self.num_query_per_req
++                or input_batch.num_draft_tokens != input_batch.num_reqs * self.num_speculative_steps
 +                or num_speculative_tokens != self.num_speculative_steps
 +            )
 +        )

@@ -1,129 +1,117 @@
-# Inkling 2 Mini — Ciru Wave 5.2 Benchmarks, Quality Audit, and Roofline Analysis
+# Inkling 2 Mini — Ciru Wave 6.3 Benchmarks, Quality Audit, and Roofline Analysis
 
 All measurements below were recorded on Ciru: **AMD Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`, 20 WGPs / 40 CUs, 128 GB unified LPDDR5X)**, NixOS, Python `3.12.12`, PyTorch `2.13.0+rocm10.0.0` (HIP `7.15.26333`), Triton `3.8.0+git669b31ac`, vLLM `0.34.0+rocm100`.
 
 ---
 
-## 1. Key kernel optimizations in Wave 5.2
+## 1. Optimization evolution (Wave 5.2 → Wave 6.3)
 
-1. **Pre-tiled FP16 WMMA MoE (`turbo_kernels.py`):**
-   - Prefill (`M=64, N=128, K=64`) and small-batch/DSpark decode (`M=16, N=128, K=64`) with FP16 matrix-core WMMA (`tl.dot` on `gfx1151`), inline NVFP4 / C1 / mixed unpacking, and fused gated softcap activation.
-   - Enabled for both HIP-graph C1 verification (`M <= 8`) and eager small-batch execution (`2 <= M <= 15`, unlocking 1.8× faster probabilistic DSpark).
-2. **Tiled RDNA 3.5 FlashAttention (`turbo_kernels.py`):**
-   - Local sliding-window prefill (`bq=64, bn=32, nw=4`) and global relative-bias FlashAttention (`PAGE=16/64`), plus split-KV decode attention (`turbo_rel_decode_m8_attention`).
-3. **Target & Draft W6 / W4 WMMA + Draft HIP Graph:**
-   - W6 WMMA for `QKVR`, `WO`, and `lm_head` on verification batches (`2 <= M <= 8`).
-   - W4 WMMA for DSpark draft `base_head`, `MLP`, and `Markov` heads, plus warmup-phase DSpark draft HIP graph capture.
-4. **Fused Loop & Residual Ops:**
-   - `Q=3` shared-stack `attn_res` kernel (2.38× vs. unbatched per-query dispatches), fused loop prefill blend (1.60×), and `fast_route_m8` fused router alignment.
-
----
-
-## 2. Prompt processing (PP) scaling — Wave 5.2 vs. Baseline ROCm port
-
-Measured in Ciru's C1-fitted profile (`--batch-tokens 4096`, DSpark `K=7`):
-
-| Prompt Length | Baseline ROCm port | Wave 5.2 Turbo | Speedup | Notes |
-|---:|---:|---:|---:|---|
-| 128 tok | 473–573 tok/s | **700.8 tok/s** | +22–48% | Launch-overhead bound |
-| 512 tok | 852.0 tok/s | **1,279.6 tok/s** | **+50.2%** | |
-| 2,048 tok | 1,024.7 tok/s | **1,645.0 tok/s** | **+60.5%** | |
-| 3,840 tok | 1,005.5 tok/s | **1,691.3 tok/s** | **+68.2%** | Peak prefill efficiency |
-| 8,192 tok | 889.9 tok/s | **1,640.8 tok/s** | **+84.4%** | |
-| 32,768 tok | 780.1 tok/s | **1,248.3 tok/s** | **+60.0%** | |
-| 65,536 tok | 646.8 tok/s | **788.5 tok/s** | **+21.9%** | Known preview drop-off (global attention $O(N^2)$ + thermal throttling) |
+1. **Wave 5.2 (Single-Stream Foundation):**
+   - Pre-tiled FP16 WMMA MoE (`M=64, N=128, K=64` prefill; `M=16, N=128, K=64` decode), tiled RDNA 3.5 local/global FlashAttention, W6 WMMA `QKVR`/`WO`/`lm_head`, W4 DSpark draft `base_head`/`MLP`/`Markov`, `Q=3` shared-stack `attn_res`, and `fast_route_m8`.
+2. **Native ROCm `gfx1151` Vision:**
+   - Ported Inkling 2 Mini's PE-Lang ViT (`model.visual.*`, 422 tensors) to ROCm Triton (`ops/vision.py` with IEEE-754 RNE uint32 BF16 rounding replacing CUDA PTX) + ROCm SDPA (`vision.py`).
+3. **Wave 6.0 (Multi-Agent Concurrent Kernels):**
+   - Unlocked pre-tiled Coda & Mixed FP16 WMMA in eager `c8`/`prob`, added zero-spill FP16-scaled batched Gluon WMMA (`M <= 64`) for `QKVR`, `lm_head`, DSpark `base_head`, `MLP`, and `Markov`, batched multi-request split-KV decode attention, and 9× D-split loop blend (`C8` jumped `88.92 → 168.46 tok/s`, 8-agent vision studio dropped `498.2 s → 404.7 s`).
+4. **Wave 6.1–6.2b (64K Prefill Cliff Fix + Multi-Request FULL Target & Draft HIP Graphs):**
+   - **Hybrid AOTriton-Far + Triton-Near Global Prefill (`turbo_kernels.py`):** On global layers (`KVH=8`), far keys (`past - E_PAD >= 2048`) have zero relative bias or causal mask and run via `_gather_paged_kv_hnd_kernel` + native ROCm AOTriton FlashAttention-2 (`aten._scaled_dot_product_flash_attention`, GQA direct, returning `out_far` and `lse_far`), merged seamlessly into `_turbo_prefill_rel_attn_near_merge_kernel` (`6.46×` faster per global layer at 64K: `861.8 ms → 133.4 ms`, `0.0000` BF16 max error).
+   - **True `KVH=8` Global Decode Split Schedule:** `10 / 5 / 6 / 6` splits for `B = 1 / 2 / 4 / 8`, saturating `238.1 GB/s` at `B=1` 64K (`9.02 ms` across 8 global layers) and `385 GB/s` effective at `B=4..8`.
+   - **Multi-Request FULL Target + Draft HIP Graphs (`reqs = 1..8`, Greedy & Prob):** Reclaimed `~49 ms/step` of eager host launch overhead (`65.3% → 95.2%` GPU busy across `1,642` kernels/step at `B=8`, captured in `1 s` / `0.34 GiB`).
+5. **Wave 6.3 (Dual-Depth Adaptive DSpark HIP Graphs):**
+   - Captures two DSpark graph managers against one shared model & KV cache (`num_speculative_tokens_per_batch_size: [[1, 1, 7], [2, 8, 4]]`, `9` Target + `9` Draft FULL HIP Graphs in `1 s` / `0.47 GiB`), unlocking `B=1` fused W4 Markov argmax, W8 draft backbone, and fused M8 loop inside `--seqs 8` servers (**100.23 tok/s at `B=1` and 310.20 agg tok/s at `B=8` from one server**).
 
 ---
 
-## 3. Token generation (TG) — Wave 5.2 vs. Baseline ROCm port
+## 2. Long-context PP & TG scaling (4K → 62K, cliff eliminated)
 
-| Workload | Baseline ROCm port | Wave 5.2 Turbo | Speedup |
+### A. Global prefill kernel microbenchmark (true `KVH=8`, `q_len=4096`, permuted paged KV)
+
+| Past context | Triton-only (`ms/layer`) | **Hybrid AOTriton+Triton (`ms/layer`)** | Speedup | 8-layer chunk save | BF16 max err |
+|---:|---:|---:|---:|---:|---:|
+| 4,096 | 31.24 ms | **25.31 ms** | **1.23×** | 47.4 ms | `0.0001` |
+| 8,192 | 55.84 ms | **33.26 ms** | **1.68×** | 180.7 ms | `0.0001` |
+| 16,384 | 125.92 ms | **49.10 ms** | **2.56×** | 614.6 ms | `0.0001` |
+| 32,768 | 341.17 ms | **79.25 ms** | **4.31×** | 2,095.4 ms | `0.0001` |
+| 49,152 | 662.89 ms | **110.19 ms** | **6.02×** | 4,421.6 ms | `0.0000` |
+| **61,440 (64K)** | 861.83 ms | **133.41 ms** | **6.46×** | **5,827.4 ms** | **`0.0000`** |
+
+### B. Live end-to-end 4K → 62K curve (`long --context 65536 --batch-tokens 4096 --turbo`)
+
+| Prompt Length | TTFT | Wave 5.2 PP | **Wave 6.3 PP** | PP Delta | **Wave 6.3 TG** |
+|---:|---:|---:|---:|---:|---:|
+| 4,076 tok | 2.70 s | 1,691.3 *(3.8K)* | **1,507.4 tok/s** | — | 56.1–100.7 tok/s |
+| 15,954 tok | 11.03 s | — | **1,445.8 tok/s** | — | **70.5 tok/s** |
+| 32,070 tok | 23.19 s | 1,248.3 tok/s | **1,383.0 tok/s** | **+10.8%** | **52.4 tok/s** |
+| 47,977 tok | 36.23 s | — | **1,324.2 tok/s** | — | **59.4 tok/s** |
+| **62,024 tok** | **48.67 s** | 788.5 tok/s *(64K)* | **1,274.4 tok/s** | **+61.6%** | **46.9 tok/s** |
+
+### C. Speculative decoding at 62K (`K=0 --no-spec` vs. `K=4` vs. `K=7`, 256 output tokens)
+
+| Arm (`long --context 65536 --turbo`) | 32K PP | 32K TG (`T=0`) | 62K PP | 62K TG (`T=0`) | 62K TG (`T=0.7`) | 62K Total (`T=0`) |
+|---|---:|---:|---:|---:|---:|---:|
+| `K=0` (`--no-spec`, HIP graph) | **1,447.8** | 36.93 | **1,324.2** | 30.73 | 30.73 | 55.15 s |
+| **`K=4` (DSpark + HIP graph)** | 1,382.2 | **50.87** (`+38%`) | 1,270.5 | **44.13** (`+44%`) | 33.98 (`+11%`) | **54.61 s** |
+| **`K=7` (DSpark + HIP graph)** | 1,364.3 | 41.50 (`+12%`) | 1,254.1 | **44.49** (`+45%`) | **41.07** (`+34%`) | 55.20 s |
+
+Speculative decoding remains a strong net win at 62K (`+44–45%` TG) because it amortizes the 2.15 GB (`9.02 ms/step`) target global KV-cache read across ~3 accepted tokens/step, while draft KV population adds only `1.98 s` (`4.2%`) across a 62K prompt.
+
+---
+
+## 3. Speculative depth sweep (`K = 0..7 × B = 1..8`) & Multi-Request HIP Graphs
+
+### A. Eager probabilistic depth sweep (`prob --seqs 8`, `T=0.7`, Wave 6.0 kernels)
+
+| Depth `K` | `B=1` | `B=2` (agg / req) | `B=4` (agg / req) | `B=8` (agg / req) | Mean Accepted / Draft |
+|---|---:|---:|---:|---:|---:|
+| `K=0` (`--no-spec`) | 33.40 | 50.45 / 25.22 | 73.23 / 18.31 | 104.61 / 13.08 | 0.00 |
+| `K=1` | 37.71 | 60.15 / 30.07 | 85.15 / 21.29 | 128.06 / 16.01 | 0.77 |
+| `K=2` | 54.88 | 63.97 / 31.99 | 97.41 / 24.35 | 158.77 / 19.85 | 1.40 |
+| `K=3` | 49.96 | **85.58 / 42.79** | 102.36 / 25.59 | 177.78 / 22.22 | 1.85 |
+| **`K=4`** | **74.46** | 65.80 / 32.90 | **107.46 / 26.87** | **228.06 / 28.51** | **2.36** |
+| `K=7` | 57.59 | 68.20 / 34.10 | 95.95 / 23.99 | 196.36 / 24.54 | 2.58 |
+
+### B. Wave 6.3 FULL Target + Draft HIP Graphs (`reqs = 1..8`)
+
+| Mode | `B=1` | `B=2` (agg / req) | `B=4` (agg / req) | `B=8` (agg / req) | `B=1` return |
+|---|---:|---:|---:|---:|---:|
+| **`c8` Adaptive `K=7/K=4` (`T=0`)** | **100.23 tok/s** | 93.42 / 46.71 | **203.42 / 50.85** | **310.20 / 38.78** | **97.78 tok/s** |
+| `c8` Fixed `K=4` (`T=0`) | 77.04 tok/s | 89.01 / 44.50 | 201.83 / 50.46 | **316.64 / 39.58** | — |
+| `c1` Dedicated (`K=7`, `T=0`) | **100.68 tok/s** | — | — | — | — |
+| **`prob` `K=4` (`T=0.7`)** | **86.52 tok/s** | **101.36 / 50.68** | 136.01 / 34.00 | **238.73 / 29.84** | — |
+
+---
+
+## 4. Realistic Multi-Agent Vision Workload (8-Agent AMD Logo 3D Studio)
+
+Tested end-to-end on the **8-agent AMD Logo 3D Studio** (`showcase` workflow, native ROCm vision enabled, native `inkling` reasoning & strict tool calling, `T=0.7`, `prob --seqs 8 --prefix-cache --tools --vision --turbo`):
+
+| Measurement | Wave 5.2 | Wave 6.0 | **Wave 6.2b / 6.3** |
 |---|---:|---:|---:|
-| C1 Held Pooled (DSpark `K=7`, 4K ctx) | 64.15 tok/s (59.51 ms/rd) | **74.13 tok/s** (48.89 ms/rd) | **+15.6%** |
-| — `order` (JSON) | — | **97.7–101.2 tok/s** | — |
-| — `code` (`bisect_left`) | — | **70.8 tok/s** | — |
-| — `math` | — | **69.0 tok/s** | — |
-| 32K Context TG (DSpark `K=7`) | 49.41 tok/s | **63.69 tok/s** | **+28.9%** |
-| 64K Context TG (DSpark `K=7`) | 36.38 tok/s | **54.08 tok/s** | **+48.7%** |
-| Probabilistic DSpark (`prob`, eager, `K=7`) | ~20 tok/s | **36.51 tok/s** (`order` 55.52) | **~1.8×** |
-| C8 Eager Aggregate (8 concurrent, greedy `K=7`) | 88.58 tok/s | **168.46 tok/s** *(Wave 6.0; Wave 5.2 was 88.92)* | **+90.2% (1.90×)** |
-| C8 Eager Aggregate (8 concurrent, `T=0.7`) | — | **173.83 tok/s** *(Wave 6.0)* | — |
-
-### Unmodified Hugging Face checkpoint (`EXPERT_POLICY=source`, no fitted banks)
-
-Measured directly on `thinkingmachines/Inkling-2-Mini` (`6e7c8248`) with stock MXFP8 coda layers (20–23) and Wave 5.2 pre-tiled FP16 WMMA on all 20 NVFP4 layers (0–19):
-
-- **`order` (JSON):** `84.12 tok/s` (TTFT `0.189 s`, exact JSON)
-- **`tool` (`get_weather`):** `79.73 tok/s` (exact native tool call)
-- **`p3500` (3,900 prompt tokens):** `1,494.6 PP tok/s` (TTFT `2.609 s`), `72.75 TG tok/s`
-- **`code` (`bisect_left`):** `69.79 tok/s` (exact Python implementation)
-- **`math`:** `54.61 tok/s`
+| **Pooled per-request TG** | 17.38 tok/s | 21.37 tok/s | **25.16 tok/s** (**+44.8%** vs. W5.2) |
+| **Whole-workflow output rate** (incl. vision, PP, tools, renders) | ~70.0 tok/s | 86.23 tok/s | **92.5 tok/s** |
+| `conc=2–3` (12K–22K context) pooled / peak TG | — | — | **31.0–31.8 / 53.1 tok/s** |
+| Cold 30.7K PP / Cached 29.8K TTFT | — | — | **1,581 tok/s** / **1.04 s** |
+| Prefix cache hit rate / Per-draft acceptance (`K=4, T=0.7`) | — | — | **73.3%** / **62.9%** (`3.51` tok/step) |
+| Controlled C8 Greedy (`T=0`, `B=8`) | 88.92 tok/s | 168.46 tok/s | **310.20–316.64 tok/s** (**3.5×**) |
 
 ---
 
-## 4. Full-vocabulary numerical fidelity & functional audit
+## 5. GPU Profiler Roofline (Wave 6.2b / 6.3)
+
+- **4K Prefill Chunk:** `2,404 ms` wall, `2,385 ms` GPU busy (**99.2% GPU utilization** across `1,503` kernels; 53.4% FP16 WMMA MoE, 13.1% attention, 11.4% rocBLAS dense projections).
+- **Steady-State `B=8, K=4` Target + Draft FULL HIP Graph Step:** `98.4 ms` wall, `93.5 ms` GPU busy (**95.2% GPU utilization**, only `4.8 ms` host idle across `1,642` kernel launches — down from `54.1 ms` / `37.1%` idle before multi-request HIP graphs).
+- **Remaining Hardware Ceiling:** Routed MoE (`_source_wmma_turbo_kernel` + `_mixed_wmma_turbo_kernel` + `_coda_wmma_turbo_kernel`) now accounts for **~69% of GPU time at `B=8`** and **~53% at 4K prefill**, approaching Strix Halo's physical LPDDR5X read bandwidth (`~238 GB/s`) and RDNA 3.5 WMMA throughput.
+
+---
+
+## 6. Full-vocabulary numerical fidelity & functional audit
 
 Evaluated across **2,044 teacher-forced tokens** over the full 200,058-token vocabulary against the BF16 reference:
 
-| Metric | Baseline ROCm port | Wave 5.2 Turbo | Delta |
+| Metric | Baseline ROCm port | Ciru Turbo | Delta |
 |---|---:|---:|---:|
 | Mean forward KL | 0.00784 nats | **0.00948 nats** | +0.00164 nats |
 | Max single-token KL | 0.2713 nats | **0.2737 nats** | +0.0024 nats |
 | Mean ΔNLL | — | **+0.00316 nats** | +0.12% of 2.48 NLL |
 | Top-1 token agreement | 94.32% | **93.74%** | -0.58% |
 
-Functional verification checks (all passed on Wave 5.2):
-- `order`: exact JSON (`ok=True`, schema valid)
-- `math`: exact integer answer (`28`)
-- `code`: passed all **7,392 exhaustive `bisect_left` test cases**
-- Tool calling (`get_weather`) + `inkling` reasoning parser: exact tool name, JSON args, and separated reasoning stream.
-
----
-
-## 5. Realistic Multi-Agent Vision Workload (8-Agent AMD Logo 3D Studio) & GPU Trace
-
-Tested end-to-end on the **8-agent AMD Logo 3D Studio** (`showcase` workflow, native ROCm vision enabled, native `inkling` reasoning & strict tool calling, probabilistic `T=0.7`, `prob --seqs 8 --context 32768 --batch-tokens 4096 --kv-mib 24576 --prefix-cache --tools --vision --turbo`):
-
-| Measurement | Wave 5.2 | Wave 6.0 | Delta |
-|---|---:|---:|---:|
-| Workflow outcome | **Complete** (rev 17) | **Complete** (rev 14) | All 8 roles autonomous |
-| Total wall time (empty scene -> approved 3D scene) | 498.22 s (8m 18s) | **404.72 s (6m 45s)** | **-93.5 s (-18.8%)** |
-| First visible 3D contribution | 121.43 s | **73.35 s** | **-48.1 s (1.66× faster)** |
-| Vision-bearing model requests | 37 (`0` errors) | 27 (`0` errors) | — |
-| Peak concurrent active agents | 8 | 8 | — |
-| Total generated tokens (workflow) | 38,778 | 34,898 | — |
-| Whole-workflow output throughput | 77.83 tok/s | **86.23 tok/s** | **+10.8%** |
-| Aggregate active-decode TG | 77.37 tok/s | **86.72 tok/s** | **+12.1%** |
-| Pooled per-request TG | 17.38 tok/s | **21.37 tok/s** | **+23.0%** |
-| Controlled C8 Greedy (`T=0`, 8 concurrent) | 88.92 tok/s | **168.46 tok/s** | **+89.5% (1.90×)** |
-| Controlled C8 Prob (`T=0.7`, 8 concurrent) | — | **173.83 tok/s** | — |
-
-### Live 8-Agent ROCm GPU Profiler Breakdown (64 MB trace, `M=64` peak concurrency)
-
-Captured during peak 8-agent concurrency (`4.487 s` span, `3.646 s` GPU busy = **81.3% busy**, `30,346` GPU kernel launches across 18 rounds):
-
-| Kernel / Category | GPU Time | Share of Busy | Launches | Root Cause & Next Kernel Fix |
-|---|---:|---:|---:|---|
-| `_source_wmma_turbo_kernel` (NVFP4 MoE) | 1,145.2 ms | 31.4% | 1,260 | Already fast (`909 us/call`) |
-| `_packed_prefill_kernel` (Mixed/Coda MoE fallback) | **819.5 ms** | **22.5%** | 468 | **`CODA_WMMA_PRETILE` / `MIXED_WMMA_PRETILE` gated on `target_graph=1`** (`1,751 us/call`, ~2× slower than turbo!) |
-| `hipBLASLt/rocBLAS` BF16 GEMM (`QKVR`/`WO`/`LM_head`/`DSpark`) | **731.3 ms** | **20.1%** | 5,328 | **W6/W4 WMMA gated on `M <= 8`** (`0.22 ms` quant linear vs `731 ms` BF16 at `M=64`!) |
-| `_rel_attention_kernel` (unbatched decode fallback) | **636.8 ms** | **17.5%** | 918 | **`turbo_rel_decode_m8_attention` gated on `B == 1`** (`694 us/call`) |
-| Host launch gap (GPU idle) | **841.0 ms** | *(18.7% wall)* | — | Eager mode (`1,686` launches/round, no multi-req HIP graphs) |
-| `_fused_loop_blend_p1_kernel` + sampling (`topk_topp`/`tanh`) | 151.2 ms | 4.1% | 918 | Uncoalesced `M=64` loop blend + 4-pass 200K vocab sampling |
-
----
-
-## 6. Single-stream GPU roofline & prioritized next kernel targets
-
-Single-stream C1 DSpark `K=7` traces show **94.2% GPU utilization** (`35.8 ms/round` = 71% MoE sustaining >90–95% of Strix Halo's ~240 GB/s physical DRAM read ceiling; `3.3 ms/round` host gap).
-
-### Highest-ROI next kernels (from live 64K + 8-agent AMD Logo 3D traces)
-
-1. **Enable Pre-Tiled Coda & Mixed FP16 WMMA in Eager `c8`/`prob` (`~400 ms / 11%` GPU saved immediately):** Remove the `target_graph` gate on `CODA_WMMA_PRETILE` and `MIXED_WMMA_PRETILE` so the 13 mixed/coda visits per round stop falling back to `_packed_prefill_kernel`.
-2. **Batched `M=9..64` W6 & W4 WMMA (`~450–500 ms / 13%` GPU saved):** Generalize `w6_wmma_linear` (`QKVR`, `WO`, `lm_head`) and W4 DSpark (`base_head`, `MLP`, `Markov`) beyond `M <= 8` so concurrent multi-agent batches read 4–6 bit weights instead of BF16.
-3. **Batched Multi-Request Split-KV Decode Attention (`~450 ms / 12%` GPU saved):** Extend `turbo_rel_decode_m8_attention` from `seq_lens.shape[0] == 1` to `grid = (B, H, splits)` to replace `_rel_attention_kernel` during concurrent decoding.
-4. **Multi-Request HIP Graph Capture Buckets (`reqs = 1, 2, 4, 8`) (`~650 ms` host gap saved):** Eliminates the 18.7% CPU launch idle time across 1,686 kernel dispatches/round in eager `c8`/`prob`.
-5. **64K Global Attention Tiling:** Improve tiling/split-K and register occupancy in the 8 global attention visits for 32K–64K+ prefills to close the 64K PP drop-off (`1,248 -> 789 tok/s`).
-6. **Fused Multi-Token Loop Blend & Logits+Softcap+Sampling:** Optimize `fused_loop_blend` for `M > 8` and fuse `tanh` softcap + temperature + top-k/top-p over the 200K vocabulary.
-
-**Combined projected multi-agent impact (items 1–4):** `4.49 s -> ~2.5 s` per 18 rounds (**~1.8× faster concurrent multi-agent throughput**, lifting 8-agent aggregate TG from ~77–89 tok/s to **~140–160+ tok/s**).
+All functional checks passed across Wave 5.2 → Wave 6.3: exact JSON (`order`), math (`17 * 23 = 391`, `28`), exhaustive 7,392-case Python `bisect_left`, native `inkling` reasoning & tool calling (`get_weather`), native ROCm vision (`ornith-bot.png`, `amd-logo.png`, 3D scene frames), and 62K long-context + `B=1 → 8 → 1` adaptive HIP graph transitions.
